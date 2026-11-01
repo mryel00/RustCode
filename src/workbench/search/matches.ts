@@ -3,8 +3,21 @@
 
 import type { SearchPreview, TextMatch } from '../../backend';
 
-/** VS Code's `search.maxResults` default. */
-export const DEFAULT_MAX_RESULTS = 20000;
+/** VS Code's `strings.containsUppercaseCharacter`, used by `search.smartCase`. */
+export function containsUppercaseCharacter(target: string, ignoreEscapedChars = false): boolean {
+  if (!target) return false;
+  if (ignoreEscapedChars) target = target.replace(/\\./g, '');
+  return target.toLowerCase() !== target;
+}
+
+/**
+ * VS Code's `QueryBuilder.isCaseSensitive`: with `search.smartCase`, a
+ * pattern with an uppercase letter (not escaped, for regexes) matches case.
+ */
+export function effectiveCaseSensitive(pattern: string, isRegex: boolean, matchCase: boolean, smartCase: boolean): boolean {
+  if (smartCase && containsUppercaseCharacter(pattern, isRegex)) return true;
+  return matchCase;
+}
 
 /** VS Code's `MatchImpl.MAX_PREVIEW_CHARS`. */
 const MAX_PREVIEW_CHARS = 250;

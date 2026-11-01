@@ -47,8 +47,10 @@ corrupted.
 Opening a folder starts a recursive watcher (`rc-core::watcher`, built on
 `notify`) in the background. Like VS Code it collects raw events for 75 ms,
 coalesces them (created+deleted cancel out, deleted+created becomes changed,
-deletes inside a deleted folder are dropped) and skips VS Code's default
-`files.watcherExclude` (`.git/objects`, `.git/subtree-cache`, `.hg/store`).
+deletes inside a deleted folder are dropped) and skips paths matching
+`files.watcherExclude` (default `.git/objects`, `.git/subtree-cache`,
+`.hg/store`; absolute patterns match absolute paths, and an excluded folder
+hides everything in it). Changing that setting restarts the watcher.
 Each batch goes to three places:
 
 - **Language servers** get `workspace/didChangeWatchedFiles`, filtered by the
@@ -155,11 +157,33 @@ ready, using the server's own completion trigger characters.
 
 ## Settings
 
-`rc-core::settings` reads the folder's `.vscode/settings.json` (comments and
-trailing commas allowed, dotted or nested keys), so projects set up for
-VS Code behave the same. Only `files.exclude` and `search.exclude` are read
-so far. Like VS Code, object settings are merged key by key with their
-defaults, so `"**/.git": false` shows `.git` again.
+`rc-core::settings` reads VS Code's own settings files, so projects and habits
+set up for VS Code carry over. Like VS Code, three layers are laid over each
+other: defaults, VS Code's user settings (`~/.config/Code/User/settings.json`
+on Linux, `~/Library/Application Support/Code/…` on macOS, `%APPDATA%\Code\…`
+on Windows; the first existing one of VS Code, Insiders, VSCodium and
+Code - OSS), then the folder's `.vscode/settings.json`. Object settings are
+merged key by key (so `"**/.git": false` shows `.git` again); other settings
+are replaced. Files may have comments and trailing commas, and keys may be
+dotted or nested.
+
+Settings read, all with VS Code's defaults:
+
+| Setting | Used by |
+|---|---|
+| `files.exclude`, `search.exclude` | explorer, search |
+| `files.watcherExclude` | file watcher |
+| `search.useIgnoreFiles`, `search.useParentIgnoreFiles`, `search.useGlobalIgnoreFiles`, `search.followSymlinks` | search walk |
+| `search.maxResults` (`null`: no limit) | search, backend and open documents |
+| `search.smartCase`, `search.searchOnType`, `search.searchOnTypeDebouncePeriod`, `search.seedWithNearestWord`, `editor.find.seedSearchStringFromSelection` | Search view |
+
+The UI gets its share as `UiSettings` with the workspace info and every
+reload. Like VS Code's `QueryBuilder`, the UI resolves smart case into the
+query's case sensitivity, so disk and open documents agree. Seeding follows
+VS Code's `getSelectionTextFromEditor`: a multi-line selection is joined with
+`\n`, an empty one gives the word at the cursor only with
+`seedWithNearestWord`, regex mode escapes the text, and nothing is seeded
+while the Search view has focus.
 
 Exclude expressions follow `base/common/glob.ts` (`rc-core::glob`): patterns
 map to `true`, `false` or a sibling clause (`{ "when": "$(basename).ts" }`,
@@ -167,10 +191,13 @@ excluded only when that sibling exists), and `!`-prefixed keys are
 exceptions. The ripgrep walk can only apply plain enabled patterns; sibling
 clauses and exceptions are applied to every result.
 
-Patterns that are not valid globs are left out and reported, and a file that
-is not valid JSON falls back to the defaults with a warning. The file watcher
-reloads the settings when the file (or `.vscode`) changes and sends
-`settingsChanged`; the explorer then lists its folders again.
+Values of the wrong type and patterns that are not valid globs are left out
+and reported; a file that is not valid JSON is ignored as a whole (the other
+layers still apply), with a warning naming the file. The folder watcher
+notices changes to `.vscode/settings.json`, and a separate watch on the user
+settings folder (not recursive, ignoring reads) notices the user file; either
+reloads the settings and sends `settingsChanged`, and the explorer lists its
+folders again.
 
 The explorer applies `files.exclude` like VS Code (`evaluateExcludeTreeEntry`):
 an entry is hidden when it or its folder is excluded and no exception covers
@@ -206,10 +233,10 @@ Extensions are planned, not built. The design keeps that door open:
 
 - A crashed language server is not restarted automatically (reopen the folder).
 - No terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
-- Settings: only the workspace's `.vscode/settings.json`, and only
-  `files.exclude` and `search.exclude`; no user settings. `files.watcherExclude`
-  is fixed to VS Code's defaults. The explorer does not show excluded files
-  that are open in an editor (VS Code does).
+- Settings: only the settings in the table above, from the default VS Code
+  profile (no other profiles, `.code-workspace` files or language-specific
+  `[lang]` blocks). The explorer does not show excluded files that are open in
+  an editor (VS Code does).
 - No diff view for save conflicts (VS Code's "Compare").
 - Search: no search editor, tree view mode, search history or replace diff
   preview; non-UTF-8 files are searched lossily but cannot be opened.

@@ -1,6 +1,14 @@
 // Unit tests for the search helpers. Run: node --experimental-strip-types scripts/test-search.ts
 import assert from 'node:assert/strict';
-import { comparePaths, lcut, makePreview, matchId, previewParts, resultCountMessage } from '../src/workbench/search/matches.ts';
+import {
+  comparePaths,
+  effectiveCaseSensitive,
+  lcut,
+  makePreview,
+  matchId,
+  previewParts,
+  resultCountMessage,
+} from '../src/workbench/search/matches.ts';
 import { isMultilineQuery, ReplacePattern, type PatternInfo } from '../src/workbench/search/replace-pattern.ts';
 
 const info = (pattern: string, isRegExp = false, extra: Partial<PatternInfo> = {}): PatternInfo => ({
@@ -70,5 +78,13 @@ assert.deepEqual(sorted, ['B.ts', 'README.md', 'a/z.ts', 'src/a2.ts', 'src/a10.t
 
 assert.equal(resultCountMessage(1, 1), '1 result in 1 file');
 assert.equal(resultCountMessage(3, 2), '3 results in 2 files');
+
+// search.smartCase: an uppercase letter makes the search case sensitive; escaped ones in regexes do not.
+assert.equal(effectiveCaseSensitive('foo', false, false, true), false);
+assert.equal(effectiveCaseSensitive('Foo', false, false, true), true);
+assert.equal(effectiveCaseSensitive('\\Sfoo', true, false, true), false);
+assert.equal(effectiveCaseSensitive('\\Sfoo', false, false, true), true);
+assert.equal(effectiveCaseSensitive('Foo', false, false, false), false);
+assert.equal(effectiveCaseSensitive('foo', false, true, true), true);
 
 console.log('ok: search helpers');

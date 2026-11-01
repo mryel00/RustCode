@@ -15,4 +15,4 @@ pub use document::{DiskChange, DiskRead, DiskStamp, Document, DocumentError, Doc
 pub use fs::{DirEntry, list_dir};
 pub use language::language_id_for_path;
 pub use search::{FileMatches, SearchComplete, SearchError, TextMatch, TextSearch, TextSearchQuery};
-pub use watcher::{FileChange, FileChangeKind, FileWatcher, WatchEvent};
+pub use watcher::{watch_file, FileChange, FileChangeKind, FileWatch, FileWatcher, WatchEvent};

@@ -2,7 +2,7 @@
 //!
 //! Mirrors VS Code's watcher: raw events are collected for a short delay,
 //! coalesced (`coalesce`, a port of VS Code's `EventCoalescer`) and filtered by
-//! the default `files.watcherExclude` patterns before being handed out.
+//! the `files.watcherExclude` patterns before being handed out.
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{
@@ -17,7 +17,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// VS Code's default `files.watcherExclude`, matched relative to the watched folder.
+/// VS Code's default `files.watcherExclude`. Patterns are matched relative to
+/// the watched folder, absolute ones against the absolute path.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".git/objects/**",
     ".git/subtree-cache/**",
@@ -86,7 +87,7 @@ impl FileWatcher {
         excludes: &[&str],
         on_event: impl Fn(WatchEvent) + Send + 'static,
     ) -> Result<Self, WatchError> {
-        let excludes = build_globset(excludes)?;
+        let excludes = Excludes::new(excludes)?;
         let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = tx.send(event);
@@ -131,7 +132,7 @@ pub fn build_globset(patterns: &[&str]) -> Result<GlobSet, globset::Error> {
 fn deliver(
     rx: mpsc::Receiver<notify::Result<notify::Event>>,
     root: &Path,
-    excludes: &GlobSet,
+    excludes: &Excludes,
     on_event: impl Fn(WatchEvent),
 ) {
     // Wait for a first event, then collect for COALESCE_DELAY and flush.
@@ -170,8 +171,76 @@ fn deliver(
     }
 }
 
-fn is_excluded(root: &Path, path: &Path, excludes: &GlobSet) -> bool {
-    path.strip_prefix(root).is_ok_and(|rel| excludes.is_match(rel))
+/// Watcher exclude patterns: relative ones match paths inside the folder,
+/// absolute ones absolute paths.
+struct Excludes {
+    relative: GlobSet,
+    absolute: GlobSet,
+}
+
+impl Excludes {
+    fn new(patterns: &[&str]) -> Result<Self, globset::Error> {
+        let (absolute, relative): (Vec<&str>, Vec<&str>) =
+            patterns.iter().partition(|p| Path::new(p).is_absolute() || p.starts_with('/'));
+        Ok(Self { relative: build_globset(&relative)?, absolute: build_globset(&absolute)? })
+    }
+}
+
+/// Whether `path` or a folder above it (up to `root`) is excluded: like the
+/// native watcher VS Code uses, an excluded folder hides everything in it.
+fn is_excluded(root: &Path, path: &Path, excludes: &Excludes) -> bool {
+    path.ancestors().take_while(|p| p.starts_with(root) && *p != root).any(|p| {
+        excludes.absolute.is_match(p) || p.strip_prefix(root).is_ok_and(|rel| excludes.relative.is_match(rel))
+    })
+}
+
+/// Watches one file until dropped, through its folder so that a file that is
+/// replaced, created or deleted is noticed too. `on_change` runs on a
+/// background thread, at most once per short burst of events.
+pub struct FileWatch {
+    _watcher: RecommendedWatcher,
+}
+
+pub fn watch_file(path: &Path, on_change: impl Fn() + Send + 'static) -> Result<FileWatch, WatchError> {
+    let invalid = || WatchError::Watch { path: path.to_owned(), message: "not a file path".into() };
+    let name = path.file_name().ok_or_else(invalid)?.to_owned();
+    let dir = crate::uri::canonicalize(path.parent().ok_or_else(invalid)?).map_err(|e| WatchError::Watch {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })?;
+    let target = dir.join(&name);
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })
+    .map_err(|e| watch_error(&dir, e))?;
+    watcher.watch(&dir, RecursiveMode::NonRecursive).map_err(|e| watch_error(&dir, e))?;
+    std::thread::Builder::new()
+        .name("rc-file-watch".into())
+        .spawn(move || {
+            // Reading the file (as `on_change` will) is not a change.
+            let concerns = |event: &notify::Result<notify::Event>| match event {
+                Ok(event) if matches!(event.kind, EventKind::Access(_)) => false,
+                Ok(event) => event.need_rescan() || event.paths.contains(&target),
+                Err(_) => false,
+            };
+            while let Ok(first) = rx.recv() {
+                let mut relevant = concerns(&first);
+                let deadline = Instant::now() + COALESCE_DELAY;
+                loop {
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(event) => relevant |= concerns(&event),
+                        Err(mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                if relevant {
+                    on_change();
+                }
+            }
+        })
+        .map_err(|e| WatchError::Watch { path: path.to_owned(), message: e.to_string() })?;
+    Ok(FileWatch { _watcher: watcher })
 }
 
 /// Translates one notify event into file changes.
@@ -303,8 +372,47 @@ mod tests {
     }
 
     #[test]
+    fn excluded_folders_hide_their_contents_and_absolute_patterns_work() {
+        let set = Excludes::new(&["**/node_modules", "/abs/out/**", "*.log"]).unwrap();
+        let root = Path::new("/w");
+        assert!(is_excluded(root, Path::new("/w/a/node_modules/x/y.js"), &set));
+        assert!(is_excluded(root, Path::new("/w/node_modules"), &set));
+        assert!(is_excluded(root, Path::new("/w/x.log"), &set));
+        assert!(!is_excluded(root, Path::new("/w/a/x.log"), &set));
+        assert!(!is_excluded(root, Path::new("/w/src/main.rs"), &set));
+        let abs = Excludes::new(&["/w/out/**"]).unwrap();
+        assert!(is_excluded(root, Path::new("/w/out/a/b.js"), &abs));
+        assert!(!is_excluded(root, Path::new("/w/outer.js"), &abs));
+    }
+
+    #[test]
+    fn watches_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("settings.json");
+        let (tx, rx) = mpsc::channel();
+        let _watch = watch_file(&file, move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        // Other files in the folder are not reported.
+        std::fs::write(dir.path().join("other.json"), "x").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+        // Creating, changing and replacing the file are.
+        std::fs::write(&file, "1").unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).expect("creation");
+        let tmp = dir.path().join("settings.json.tmp");
+        std::fs::write(&tmp, "2").unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).expect("replacement");
+        // Reading it is not a change.
+        while rx.recv_timeout(Duration::from_millis(300)).is_ok() {}
+        std::fs::read_to_string(&file).unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    }
+
+    #[test]
     fn default_excludes_match_git_objects_only() {
-        let set = build_globset(DEFAULT_EXCLUDES).unwrap();
+        let set = Excludes::new(DEFAULT_EXCLUDES).unwrap();
         let root = Path::new("/w");
         assert!(is_excluded(root, Path::new("/w/.git/objects/ab/cdef"), &set));
         assert!(is_excluded(root, Path::new("/w/sub/.git/objects/ab"), &set));

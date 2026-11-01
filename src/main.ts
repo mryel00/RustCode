@@ -1,7 +1,7 @@
 import './styles.css';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { ask, message, open as openDialog } from '@tauri-apps/plugin-dialog';
-import { backend, errorMessage } from './backend';
+import { backend, DEFAULT_UI_SETTINGS, errorMessage, type UiSettings } from './backend';
 import { LanguageFeatures } from './lsp/features';
 import { monaco } from './monaco/setup';
 import { Documents, type Doc } from './workbench/documents';
@@ -31,6 +31,12 @@ const searchView = new SearchView($('search-view'), $('search-actions'), searchM
 });
 const appWindow = getCurrentWindow();
 let workspaceName: string | null = null;
+let uiSettings: UiSettings = DEFAULT_UI_SETTINGS;
+
+function applySettings(settings: UiSettings): void {
+  uiSettings = settings;
+  searchView.setSettings(settings);
+}
 
 const report = (err: unknown) => toast(errorMessage(err), 'error');
 docs.onError.on((m) => toast(m, 'error'));
@@ -53,6 +59,7 @@ void backend.onFsEvent((event) => {
       toast(`File changes may not be picked up: ${event.message}`, 'warning');
       break;
     case 'settingsChanged':
+      applySettings(event.settings);
       event.warnings.forEach((w) => toast(w, 'warning'));
       void explorer.refresh();
       break;
@@ -98,12 +105,23 @@ searchView.onOpenMatch.on(({ file, match, preserveFocus }) => {
   }, report);
 });
 
-/** A single-line selection in the editor, to seed the search with (VS Code's default). */
+/**
+ * The editor's selection to seed the search with, like VS Code's
+ * `getSelectionTextFromEditor`: lines joined with `\n`; without a selection,
+ * the word at the cursor if `search.seedWithNearestWord` is on.
+ */
 function selectedText(): string | undefined {
+  if (uiSettings.seedSearchStringFromSelection === 'never') return undefined;
+  // Pressing the shortcut again inside the Search view keeps its text.
+  if ($('view-search').contains(document.activeElement)) return undefined;
   const model = group.editor.getModel();
   const selection = group.editor.getSelection();
-  if (!model || !selection || selection.isEmpty() || selection.startLineNumber !== selection.endLineNumber) return undefined;
-  return model.getValueInRange(selection);
+  if (!model || !selection) return undefined;
+  if (selection.isEmpty()) {
+    if (!uiSettings.seedWithNearestWord) return undefined;
+    return model.getWordAtPosition(selection.getStartPosition())?.word;
+  }
+  return model.getValueInRange(selection, monaco.editor.EndOfLinePreference.LF);
 }
 
 function showSearch(replace: boolean): void {
@@ -118,6 +136,7 @@ async function openWorkspace(path: string): Promise<void> {
   try {
     const info = await backend.openWorkspace(path);
     workspaceName = info.name;
+    applySettings(info.settings);
     info.settingsWarnings.forEach((w) => toast(w, 'warning'));
     searchModel.setRoot(info.root);
     searchView.setWorkspace(true);

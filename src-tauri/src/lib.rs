@@ -7,11 +7,10 @@
 
 use lsp_types::{FileChangeType, FileEvent, TextDocumentContentChangeEvent};
 use rc_core::{
-    glob::{ExcludeExpression, ParsedExclude},
-    settings::{settings_path, WorkspaceSettings},
-    watcher::DEFAULT_EXCLUDES,
-    DirEntry, DiskChange, DiskRead, DiskStamp, DocumentStore, FileChange, FileChangeKind, FileMatches, FileWatcher,
-    SaveOutcome, TextSearch, TextSearchQuery, WatchEvent,
+    glob::ParsedExclude,
+    settings::{workspace_settings_path, Settings, UiSettings},
+    DirEntry, DiskChange, DiskRead, DiskStamp, DocumentStore, FileChange, FileChangeKind, FileMatches, FileWatch,
+    FileWatcher, SaveOutcome, TextSearch, TextSearchQuery, WatchEvent,
 };
 use rc_lsp::{LspManager, ManagerEvent};
 use serde::Serialize;
@@ -50,6 +49,8 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Default)]
 struct AppState {
     session: Mutex<Option<Session>>,
+    /// VS Code's user settings file, read before the folder's settings.
+    user_settings: Option<PathBuf>,
 }
 
 /// Everything tied to the open folder.
@@ -61,29 +62,35 @@ struct Session {
     lsp: Arc<LspManager>,
     /// Set once the recursive watch is established; dropping it stops watching.
     watcher: Option<FileWatcher>,
+    /// Counts watcher (re)starts, so a slow start cannot replace a newer one.
+    watcher_generation: u64,
+    /// The `files.watcherExclude` patterns the watcher runs with.
+    watcher_excludes: Vec<String>,
+    /// Watches VS Code's user settings file while it is kept.
+    _user_settings_watch: Option<FileWatch>,
     /// The running text search, if any. Starting another one cancels it.
     search: Option<ActiveSearch>,
-    /// From `.vscode/settings.json`; reloaded when that file changes.
-    settings: Arc<Settings>,
+    /// VS Code's user settings with the folder's `.vscode/settings.json`
+    /// over them; reloaded when either file changes.
+    settings: Arc<LoadedSettings>,
 }
 
-/// Workspace settings, prepared for the explorer and search.
-struct Settings {
+/// Settings, prepared for the explorer.
+struct LoadedSettings {
+    settings: Settings,
     files_exclude: ParsedExclude,
-    search_excludes: ExcludeExpression,
-    warnings: Vec<String>,
 }
 
-impl Settings {
-    fn load(root: &std::path::Path) -> Self {
-        let settings = WorkspaceSettings::load(root);
+impl LoadedSettings {
+    fn load(user_settings: Option<&std::path::Path>, root: &std::path::Path) -> Self {
+        let settings = Settings::load(user_settings, root);
         // Settings patterns are validated while loading, so parsing succeeds.
         let files_exclude = settings
             .files_exclude
             .parse()
-            .or_else(|_| WorkspaceSettings::default().files_exclude.parse())
+            .or_else(|_| Settings::default().files_exclude.parse())
             .expect("default excludes are valid");
-        Self { files_exclude, search_excludes: settings.search_excludes(), warnings: settings.warnings }
+        Self { settings, files_exclude }
     }
 }
 
@@ -119,9 +126,9 @@ enum FsEvent {
     Rescan { documents: Vec<DiskChange> },
     /// Watching failed; external changes may go unnoticed.
     Error { message: String },
-    /// `.vscode/settings.json` changed and was loaded again: the explorer
-    /// shows what `files.exclude` now hides.
-    SettingsChanged { warnings: Vec<String> },
+    /// A settings file changed and the settings were loaded again: the
+    /// explorer lists its folders again, the UI takes the new `settings`.
+    SettingsChanged { warnings: Vec<String>, settings: UiSettings },
 }
 
 #[derive(Serialize)]
@@ -138,8 +145,9 @@ type CmdResult<T> = Result<T, String>;
 struct WorkspaceInfo {
     root: String,
     name: String,
-    /// Problems with `.vscode/settings.json`.
+    /// Problems with the settings files.
     settings_warnings: Vec<String>,
+    settings: UiSettings,
 }
 
 #[derive(Serialize)]
@@ -196,39 +204,53 @@ async fn open_workspace<R: Runtime>(app: AppHandle<R>, state: State<'_, AppState
         }
     });
 
-    let settings = Arc::new(Settings::load(&root));
+    let settings = Arc::new(LoadedSettings::load(state.user_settings.as_deref(), &root));
     let info = WorkspaceInfo {
         root: root.to_string_lossy().into_owned(),
         name: root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string()),
-        settings_warnings: settings.warnings.clone(),
+        settings_warnings: settings.settings.warnings.clone(),
+        settings: settings.settings.ui(),
     };
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    let watcher_excludes = settings.settings.watcher_exclude.plain_patterns();
+    let user_settings_watch = state.user_settings.as_deref().and_then(|path| {
+        let reload_app = app.clone();
+        // No user settings folder (VS Code not installed): nothing to watch.
+        rc_core::watch_file(path, move || reload_settings(&reload_app, id))
+            .inspect_err(|e| log::info!("not watching user settings: {e}"))
+            .ok()
+    });
     *state.session.lock().unwrap() = Some(Session {
         id,
         root: root.clone(),
         docs: DocumentStore::new(),
         lsp,
         watcher: None,
+        watcher_generation: 0,
+        watcher_excludes: watcher_excludes.clone(),
+        _user_settings_watch: user_settings_watch,
         search: None,
         settings,
     });
-    start_watcher(app, id, root);
+    start_watcher(app, id, root, watcher_excludes, 0);
     Ok(info)
 }
 
 /// Starts watching the folder in the background: a recursive watch can take a
 /// while to set up on large folders.
-fn start_watcher<R: Runtime>(app: AppHandle<R>, session_id: u64, root: PathBuf) {
+fn start_watcher<R: Runtime>(app: AppHandle<R>, session_id: u64, root: PathBuf, excludes: Vec<String>, generation: u64) {
     tauri::async_runtime::spawn_blocking(move || {
         let handler_app = app.clone();
-        let result = FileWatcher::start(&root, DEFAULT_EXCLUDES, move |event| {
+        let excludes: Vec<&str> = excludes.iter().map(String::as_str).collect();
+        let result = FileWatcher::start(&root, &excludes, move |event| {
             handle_watch_event(&handler_app, session_id, event);
         });
         match result {
             Ok(watcher) => {
                 let state = app.state::<AppState>();
                 let mut guard = state.session.lock().unwrap();
-                if let Some(session) = guard.as_mut().filter(|s| s.id == session_id) {
+                if let Some(session) = guard.as_mut().filter(|s| s.id == session_id && s.watcher_generation == generation)
+                {
                     session.watcher = Some(watcher);
                 }
             }
@@ -254,15 +276,16 @@ fn handle_watch_event<R: Runtime>(app: &AppHandle<R>, session_id: u64, event: Wa
             FsEvent::Rescan { documents: check_documents(&state, session_id, None) }
         }
         WatchEvent::Changes(changes) => {
-            let (lsp, settings_file) = {
+            let (lsp, root) = {
                 let guard = state.session.lock().unwrap();
                 match guard.as_ref().filter(|s| s.id == session_id) {
-                    Some(session) => (Arc::clone(&session.lsp), settings_path(&session.root)),
+                    Some(session) => (Arc::clone(&session.lsp), session.root.clone()),
                     None => return,
                 }
             };
             // The file itself, or `.vscode` as a whole, changed.
-            settings_changed = changes.iter().any(|c| settings_file.starts_with(&c.path));
+            let settings_file = workspace_settings_path(&root);
+            settings_changed = changes.iter().any(|c| c.path != root && settings_file.starts_with(&c.path));
             lsp.files_changed(changes.iter().filter_map(lsp_file_event).collect());
             let documents = check_documents(&state, session_id, Some(&changes));
             let changes = changes
@@ -278,24 +301,37 @@ fn handle_watch_event<R: Runtime>(app: &AppHandle<R>, session_id: u64, event: Wa
     }
 }
 
-/// Loads `.vscode/settings.json` again and tells the UI.
+/// Loads the settings again and tells the UI. A changed
+/// `files.watcherExclude` restarts the file watcher, as in VS Code.
 fn reload_settings<R: Runtime>(app: &AppHandle<R>, session_id: u64) {
     let state = app.state::<AppState>();
     let Some(root) = state.session.lock().unwrap().as_ref().filter(|s| s.id == session_id).map(|s| s.root.clone())
     else {
         return;
     };
-    let settings = Arc::new(Settings::load(&root));
-    let warnings = settings.warnings.clone();
-    {
+    let settings = Arc::new(LoadedSettings::load(state.user_settings.as_deref(), &root));
+    let warnings = settings.settings.warnings.clone();
+    let ui = settings.settings.ui();
+    let watcher_excludes = settings.settings.watcher_exclude.plain_patterns();
+    let restart = {
         let mut guard = state.session.lock().unwrap();
         let Some(session) = guard.as_mut().filter(|s| s.id == session_id) else { return };
         session.settings = settings;
+        if session.watcher_excludes == watcher_excludes {
+            None
+        } else {
+            session.watcher_excludes = watcher_excludes.clone();
+            session.watcher_generation += 1;
+            Some(session.watcher_generation)
+        }
+    };
+    if let Some(generation) = restart {
+        start_watcher(app.clone(), session_id, root, watcher_excludes, generation);
     }
     for warning in &warnings {
         log::warn!("{warning}");
     }
-    let _ = app.emit(FS_EVENT, &FsEvent::SettingsChanged { warnings });
+    let _ = app.emit(FS_EVENT, &FsEvent::SettingsChanged { warnings, settings: ui });
 }
 
 fn lsp_file_event(change: &FileChange) -> Option<FileEvent> {
@@ -455,7 +491,7 @@ async fn search_text<R: Runtime>(
 ) -> CmdResult<SearchStarted> {
     let (search, skip, open_documents, cancel, session_id) = with_session(&state, |session| {
         let search =
-            TextSearch::new(&session.root, &query, &session.settings.search_excludes).map_err(|e| e.to_string())?;
+            TextSearch::new(&session.root, &query, &session.settings.settings).map_err(|e| e.to_string())?;
         let mut skip = HashSet::new();
         let mut open_documents = Vec::new();
         for doc in session.docs.documents() {
@@ -541,8 +577,8 @@ async fn cancel_search(state: State<'_, AppState>, search_id: u64) -> CmdResult<
 }
 
 /// Registers RustCode's state and commands on a builder (shared with tests).
-fn setup<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
-    builder.manage(AppState::default()).invoke_handler(tauri::generate_handler![
+fn setup<R: Runtime>(builder: tauri::Builder<R>, state: AppState) -> tauri::Builder<R> {
+    builder.manage(state).invoke_handler(tauri::generate_handler![
         initial_path,
         open_workspace,
         list_dir,
@@ -562,7 +598,11 @@ fn setup<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let app = setup(tauri::Builder::default().plugin(tauri_plugin_dialog::init()))
+    let state = AppState { user_settings: rc_core::settings::vscode_user_settings_path(), ..AppState::default() };
+    if let Some(path) = &state.user_settings {
+        log::info!("VS Code user settings: {}", path.display());
+    }
+    let app = setup(tauri::Builder::default().plugin(tauri_plugin_dialog::init()), state)
         .build(tauri::generate_context!())
         .expect("failed to build the RustCode app");
 
@@ -634,7 +674,7 @@ mod tests {
         let file = root.join("a.txt");
         std::fs::write(&file, "one\n").unwrap();
 
-        let app = setup(mock_builder()).build(mock_context(noop_assets())).unwrap();
+        let app = setup(mock_builder(), AppState::default()).build(mock_context(noop_assets())).unwrap();
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
         let (tx, rx) = mpsc::channel::<Value>();
         app.listen_any(FS_EVENT, move |e| {
@@ -693,7 +733,7 @@ mod tests {
         std::fs::write(root.join("closed.txt"), "a\nneedle needle\n").unwrap();
         std::fs::write(root.join("other.txt"), "nothing").unwrap();
 
-        let app = setup(mock_builder()).build(mock_context(noop_assets())).unwrap();
+        let app = setup(mock_builder(), AppState::default()).build(mock_context(noop_assets())).unwrap();
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
         let (tx, rx) = mpsc::channel::<Value>();
         app.listen_any(SEARCH_EVENT, move |e| {
@@ -751,7 +791,7 @@ mod tests {
         )
         .unwrap();
 
-        let app = setup(mock_builder()).build(mock_context(noop_assets())).unwrap();
+        let app = setup(mock_builder(), AppState::default()).build(mock_context(noop_assets())).unwrap();
         let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
         let (fs_tx, fs_rx) = mpsc::channel::<Value>();
         app.listen_any(FS_EVENT, move |e| {
@@ -792,5 +832,65 @@ mod tests {
             &|e| e["kind"] == "settingsChanged",
         );
         assert_eq!(names(&webview), [".vscode", "secret.txt"]);
+    }
+
+    #[test]
+    fn vs_code_user_settings_come_first_and_reload_with_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = rc_core::uri::canonicalize(dir.path()).unwrap();
+        let user = base.join("User/settings.json");
+        let root = base.join("project");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join("noisy")).unwrap();
+        std::fs::write(root.join("from-user.txt"), "").unwrap();
+        std::fs::write(root.join("shown.txt"), "").unwrap();
+        std::fs::write(&user, r#"{ "files.exclude": { "from-user.txt": true, "shown.txt": true }, "search.smartCase": true }"#)
+            .unwrap();
+        // The folder's settings win over the user settings.
+        std::fs::write(root.join(".vscode/settings.json"), r#"{ "files.exclude": { "shown.txt": false } }"#).unwrap();
+
+        let state = AppState { user_settings: Some(user.clone()), ..AppState::default() };
+        let app = setup(mock_builder(), state).build(mock_context(noop_assets())).unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let (tx, rx) = mpsc::channel::<Value>();
+        app.listen_any(FS_EVENT, move |e| {
+            let _ = tx.send(serde_json::from_str(e.payload()).unwrap());
+        });
+        let info = invoke(&webview, "open_workspace", json!({"path": root})).unwrap();
+        assert_eq!(info["settings"]["smartCase"], true);
+        assert_eq!(info["settings"]["maxResults"], 20000);
+        let names = || -> Vec<String> {
+            let entries = invoke(&webview, "list_dir", json!({})).unwrap();
+            entries.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_owned()).collect()
+        };
+        assert_eq!(names(), [".vscode", "noisy", "shown.txt"]);
+
+        // Changing the user settings reloads them; a new watcherExclude restarts the watcher.
+        let event = wait_event(
+            &rx,
+            "user settings reload",
+            &|| {
+                std::fs::write(&user, r#"{ "files.watcherExclude": { "noisy/**": true }, "search.maxResults": null }"#)
+                    .unwrap()
+            },
+            &|e| e["kind"] == "settingsChanged" && e["settings"]["maxResults"].is_null(),
+        );
+        assert_eq!(event["settings"]["smartCase"], false);
+        assert_eq!(names(), [".vscode", "noisy", "from-user.txt", "shown.txt"]);
+        let noisy = root.join("noisy/x.txt");
+        let quiet = root.join("quiet.txt");
+        wait_event(
+            &rx,
+            "a change reported by the restarted watcher",
+            &|| {
+                std::fs::write(&noisy, "x").unwrap();
+                std::fs::write(&quiet, "x").unwrap();
+            },
+            &|e| {
+                let paths: Vec<_> = e["changes"].as_array().map(|c| c.iter().map(|c| c["path"].clone()).collect()).unwrap_or_default();
+                paths.contains(&json!(quiet)) && !paths.contains(&json!(noisy))
+            },
+        );
     }
 }

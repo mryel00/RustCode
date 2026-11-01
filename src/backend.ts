@@ -4,11 +4,33 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type * as L from 'vscode-languageserver-types';
 
+/** The settings the UI applies (rc-core's `UiSettings`), from VS Code's settings files. */
+export interface UiSettings {
+  smartCase: boolean;
+  /** `null`: no limit. */
+  maxResults: number | null;
+  searchOnType: boolean;
+  searchOnTypeDebouncePeriod: number;
+  seedWithNearestWord: boolean;
+  seedSearchStringFromSelection: 'never' | 'always' | 'selection';
+}
+
+/** VS Code's defaults, until a folder's settings are loaded. */
+export const DEFAULT_UI_SETTINGS: UiSettings = {
+  smartCase: false,
+  maxResults: 20000,
+  searchOnType: true,
+  searchOnTypeDebouncePeriod: 300,
+  seedWithNearestWord: false,
+  seedSearchStringFromSelection: 'always',
+};
+
 export interface WorkspaceInfo {
   root: string;
   name: string;
-  /** Problems with `.vscode/settings.json`. */
+  /** Problems with the settings files. */
   settingsWarnings: string[];
+  settings: UiSettings;
 }
 
 export interface DirEntry {
@@ -44,8 +66,8 @@ export type FsEvent =
   | { kind: 'changes'; changes: FsChange[]; documents: DiskChange[] }
   | { kind: 'rescan'; documents: DiskChange[] }
   | { kind: 'error'; message: string }
-  /** `.vscode/settings.json` was loaded again (`files.exclude` may hide other files). */
-  | { kind: 'settingsChanged'; warnings: string[] };
+  /** A settings file changed and was loaded again (`files.exclude` may hide other files). */
+  | { kind: 'settingsChanged'; warnings: string[]; settings: UiSettings };
 
 export type SaveOutcome = 'saved' | 'conflict';
 
@@ -87,7 +109,6 @@ export interface TextSearchQuery {
   /** "files to exclude", comma separated. */
   excludes: string;
   useExcludeSettingsAndIgnoreFiles: boolean;
-  maxResults?: number;
 }
 
 /** Part of a match's first line; `start..end` (UTF-16) is the matched part. */

@@ -80,7 +80,7 @@ fn same_name(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::WorkspaceSettings;
+    use crate::settings::Settings;
 
     #[test]
     fn folders_first_and_excludes_git() {
@@ -89,7 +89,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("b.txt"), "").unwrap();
         std::fs::write(dir.path().join("A.txt"), "").unwrap();
-        let excludes = WorkspaceSettings::default().files_exclude.parse().unwrap();
+        let excludes = Settings::default().files_exclude.parse().unwrap();
         let names: Vec<_> = list_dir(dir.path(), dir.path(), &excludes).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["src", "A.txt", "b.txt"]);
     }
@@ -103,7 +103,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
         }
-        let settings = WorkspaceSettings::parse(
+        let settings = Settings::parse(
             r#"{ "files.exclude": { "**/.git": false, "**/build": true, "!build/keep": true,
                  "**/*.js": { "when": "$(basename).ts" } } }"#,
         )

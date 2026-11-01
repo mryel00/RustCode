@@ -15,9 +15,13 @@ regex (with look-around), preserve case, files to include/exclude, `.gitignore` 
 default excludes, unsaved changes in open files, results that follow your edits, and
 replace one match, one file or everything.
 
-**Settings:** the folder's `.vscode/settings.json` is read for `files.exclude` and
-`search.exclude`, including `!` exclude exceptions (for example
-`"!node_modules/mylib": true` to search one dependency) and `when` sibling clauses.
+**Settings:** read from VS Code's own files: your VS Code user settings, then the
+folder's `.vscode/settings.json`, and they reload when either changes. Supported:
+`files.exclude` and `search.exclude` (with `!` exclude exceptions such as
+`"!node_modules/mylib": true` and `when` sibling clauses), `files.watcherExclude`,
+the `search.*` ignore-file, symlink, smart case, max results, search-on-type and
+seeding settings, and `editor.find.seedSearchStringFromSelection`. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#settings).
 
 ## Requirements
 

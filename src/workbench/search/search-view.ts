@@ -1,20 +1,20 @@
 // The Search view: VS Code's "Find in Files" side bar view, with replace,
 // include/exclude patterns and a virtualized result list.
 
-import type { TextMatch, TextSearchQuery } from '../../backend';
+import { DEFAULT_UI_SETTINGS, type TextMatch, type TextSearchQuery, type UiSettings } from '../../backend';
 import { Emitter } from '../events';
 import {
+  effectiveCaseSensitive,
   matchId,
   previewParts,
   replaceAllConfirmation,
   replaceAllDone,
   resultCountMessage,
 } from './matches';
+import { escapeRegExpCharacters } from './replace-pattern';
 import type { FileResult, SearchModel } from './search-model';
 
 const ROW_HEIGHT = 22;
-/** VS Code's `search.searchOnTypeDebouncePeriod`. */
-const SEARCH_ON_TYPE_DELAY = 300;
 
 type Row = { kind: 'file'; file: FileResult } | { kind: 'match'; file: FileResult; match: TextMatch };
 
@@ -69,6 +69,7 @@ export class SearchView {
   /** Shown instead of the result count after Replace All, until the next search. */
   private notice: string | null = null;
   private renderQueued = false;
+  private settings: UiSettings = DEFAULT_UI_SETTINGS;
 
   constructor(
     container: HTMLElement,
@@ -170,14 +171,24 @@ export class SearchView {
     this.render();
   }
 
+  /** Applies the search settings (`search.searchOnType`, `search.smartCase`, …). */
+  setSettings(settings: UiSettings): void {
+    this.settings = settings;
+    this.model.setMaxResults(settings.maxResults);
+  }
+
   setVisible(visible: boolean): void {
     this.model.setHighlights(visible);
     if (visible) this.render();
   }
 
-  /** Focuses the view (VS Code's Find in Files / Replace in Files). */
+  /**
+   * Focuses the view (VS Code's Find in Files / Replace in Files). A `seed`
+   * (the editor's selection) becomes the search text, escaped in regex mode.
+   */
   focus({ seed, replace = false }: { seed?: string; replace?: boolean } = {}): void {
     if (replace) this.setReplaceVisible(true);
+    if (seed !== undefined && this.regex.checked) seed = escapeRegExpCharacters(seed);
     if (seed !== undefined && seed !== this.searchInput.value) {
       this.searchInput.value = seed;
       this.autoSize(this.searchInput);
@@ -317,16 +328,23 @@ export class SearchView {
     this.scheduleSearch();
   }
 
+  /** Searches after typing, unless `search.searchOnType` is off (then Enter searches). */
   private scheduleSearch(): void {
     clearTimeout(this.searchTimer);
-    this.searchTimer = setTimeout(() => this.runSearch(false), SEARCH_ON_TYPE_DELAY);
+    if (!this.settings.searchOnType) return;
+    this.searchTimer = setTimeout(() => this.runSearch(false), this.settings.searchOnTypeDebouncePeriod);
   }
 
   private buildQuery(): TextSearchQuery {
     return {
       pattern: this.searchInput.value,
       isRegex: this.regex.checked,
-      isCaseSensitive: this.matchCase.checked,
+      isCaseSensitive: effectiveCaseSensitive(
+        this.searchInput.value,
+        this.regex.checked,
+        this.matchCase.checked,
+        this.settings.smartCase,
+      ),
       isWordMatch: this.wholeWord.checked,
       includes: this.includeInput.value,
       excludes: this.excludeInput.value,

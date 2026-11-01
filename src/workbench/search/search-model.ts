@@ -10,7 +10,7 @@ import { backend, errorMessage, type FileMatches, type SearchEvent, type TextMat
 import { monaco } from '../../monaco/setup';
 import { uriKey, type Doc, type Documents } from '../documents';
 import { Emitter } from '../events';
-import { charsPerLine, comparePaths, DEFAULT_MAX_RESULTS, makePreview, matchId, matchText } from './matches';
+import { charsPerLine, comparePaths, makePreview, matchId, matchText } from './matches';
 import { isMultilineQuery, ReplacePattern } from './replace-pattern';
 
 /** Monaco's default `editor.wordSeparators`, used by whole-word search in models. */
@@ -79,6 +79,7 @@ export class SearchModel {
   /** Open documents covered by the query: their results follow their edits. */
   private readonly live = new Set<string>();
   private searchId = 0;
+  private maxResults: number | null = 20000;
   private modelLimitHit = false;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly listeners = new Map<Doc, monaco.IDisposable>();
@@ -101,6 +102,11 @@ export class SearchModel {
     void backend.onSearchEvent((event) => this.handleEvent(event));
   }
 
+  /** `search.maxResults` (`null`: no limit). */
+  setMaxResults(maxResults: number | null): void {
+    this.maxResults = maxResults;
+  }
+
   setRoot(root: string | null): void {
     this.root = root;
     this.clear();
@@ -116,7 +122,7 @@ export class SearchModel {
     this.changed();
     let openDocuments: string[];
     try {
-      ({ openDocuments } = await backend.searchText(id, { ...query, maxResults: DEFAULT_MAX_RESULTS }));
+      ({ openDocuments } = await backend.searchText(id, query));
     } catch (err) {
       if (id === this.searchId) this.setState({ kind: 'error', message: errorMessage(err) });
       return;
@@ -431,6 +437,8 @@ export class SearchModel {
   private findInModel(model: monaco.editor.ITextModel): TextMatch[] {
     const q = this.query;
     if (!q || !q.pattern) return [];
+    // `search.maxResults`; the backend applies the same setting on disk.
+    const max = this.maxResults ?? Number.MAX_SAFE_INTEGER - 1;
     let found: monaco.editor.FindMatch[];
     try {
       found = model.findMatches(
@@ -440,14 +448,14 @@ export class SearchModel {
         q.isCaseSensitive,
         q.isWordMatch ? WORD_SEPARATORS : null,
         false,
-        DEFAULT_MAX_RESULTS + 1,
+        max + 1,
       );
     } catch {
       return [];
     }
-    if (found.length > DEFAULT_MAX_RESULTS) {
+    if (found.length > max) {
       this.modelLimitHit = true;
-      found = found.slice(0, DEFAULT_MAX_RESULTS);
+      found = found.slice(0, max);
     }
     const perLine = charsPerLine(q.isRegex);
     return found.map(({ range }) => {

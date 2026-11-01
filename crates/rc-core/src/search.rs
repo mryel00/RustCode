@@ -17,6 +17,7 @@
 
 use crate::{
     glob::{self, expand_braces, split_glob_aware, ExcludeExpression, ExcludeValue, ParsedExclude},
+    settings::Settings,
     uri,
 };
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -147,7 +148,10 @@ pub struct TextSearch {
     /// Globs of the second walk, which visits what exclude exceptions
     /// re-include (`None` without exceptions).
     exception_overrides: Option<Override>,
-    use_ignore_files: bool,
+    /// Local (`.gitignore`, `.ignore`, `.rgignore`), parent folder and global
+    /// ignore files.
+    ignore_files: (bool, bool, bool),
+    follow_symlinks: bool,
     max_results: usize,
     /// The whole folder is excluded (`./` in "files to exclude").
     root_excluded: bool,
@@ -155,14 +159,10 @@ pub struct TextSearch {
 
 impl TextSearch {
     /// Compiles `query` for searching `root` (an absolute, canonical folder).
-    /// `settings_excludes` are `files.exclude` and `search.exclude` merged
-    /// (see [`WorkspaceSettings::search_excludes`](crate::settings::WorkspaceSettings::search_excludes)),
-    /// applied unless the query turns exclude settings off.
-    pub fn new(
-        root: &Path,
-        query: &TextSearchQuery,
-        settings_excludes: &ExcludeExpression,
-    ) -> Result<Self, SearchError> {
+    /// From `settings` come `files.exclude` and `search.exclude` (unless the
+    /// query turns exclude settings off), the ignore file and symlink
+    /// settings, and `search.maxResults` when the query sets no limit.
+    pub fn new(root: &Path, query: &TextSearchQuery, settings: &Settings) -> Result<Self, SearchError> {
         if query.pattern.is_empty() {
             return Err(SearchError("the search pattern is empty".into()));
         }
@@ -176,8 +176,9 @@ impl TextSearch {
         for pattern in &excludes.globs {
             exclude_expr.set(glob::escape_exception(pattern), ExcludeValue::Enabled(true));
         }
-        if query.use_exclude_settings_and_ignore_files {
-            exclude_expr = exclude_expr.merged(settings_excludes);
+        let use_settings = query.use_exclude_settings_and_ignore_files;
+        if use_settings {
+            exclude_expr = exclude_expr.merged(&settings.search_excludes());
         }
         let include_globs = if includes.whole_folder { Vec::new() } else { includes.globs };
         let overrides = build_overrides(root, &include_globs, &exclude_expr.plain_patterns())?;
@@ -196,8 +197,16 @@ impl TextSearch {
             overrides,
             filter,
             exception_overrides,
-            use_ignore_files: query.use_exclude_settings_and_ignore_files,
-            max_results: query.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+            ignore_files: {
+                let local = use_settings && settings.search.use_ignore_files;
+                (
+                    local,
+                    local && settings.search.use_parent_ignore_files,
+                    local && settings.search.use_global_ignore_files,
+                )
+            },
+            follow_symlinks: settings.search.follow_symlinks,
+            max_results: query.max_results.or(settings.search.max_results).unwrap_or(usize::MAX),
             root_excluded: excludes.whole_folder,
         })
     }
@@ -242,20 +251,20 @@ impl TextSearch {
             limit_hit: AtomicBool::new(false),
             reported: self.exception_overrides.as_ref().map(|_| Mutex::new(HashSet::new())),
         };
-        let use_ignore = self.use_ignore_files;
+        let (use_ignore, use_parent, use_global) = self.ignore_files;
 
-        // The equivalent of VS Code's `rg --hidden --no-require-git --follow
-        // --no-ignore-parent --no-ignore-global [--no-ignore] -g …`.
+        // The equivalent of VS Code's `rg --hidden --no-require-git [--follow]
+        // [--no-ignore-parent] [--no-ignore-global] [--no-ignore] -g …`.
         let mut builder = WalkBuilder::new(&self.root);
         builder
             .hidden(false)
-            .parents(false)
+            .parents(use_parent)
             .ignore(use_ignore)
             .git_ignore(use_ignore)
             .git_exclude(use_ignore)
-            .git_global(false)
+            .git_global(use_global)
             .require_git(false)
-            .follow_links(true)
+            .follow_links(self.follow_symlinks)
             .ignore_case_insensitive(GLOB_CASE_INSENSITIVE)
             .overrides(self.overrides.clone())
             .threads(0);
@@ -277,7 +286,7 @@ impl TextSearch {
                 .standard_filters(false)
                 .parents(false)
                 .require_git(false)
-                .follow_links(true)
+                .follow_links(self.follow_symlinks)
                 .overrides(overrides.clone())
                 .threads(0);
             self.walk(&builder, &state, skip, cancel, &on_file, &|path, rel| {
@@ -312,13 +321,13 @@ impl TextSearch {
                 }
                 // One more than the remaining budget, to learn whether the
                 // limit is exceeded.
-                let cap = self.max_results.saturating_sub(state.total.load(Ordering::Relaxed)) + 1;
+                let cap = self.max_results.saturating_sub(state.total.load(Ordering::Relaxed)).saturating_add(1);
                 let Some(mut matches) = self.search_file(path, cap) else { return WalkState::Continue };
                 if matches.is_empty() {
                     return WalkState::Continue;
                 }
                 let before = state.total.fetch_add(matches.len(), Ordering::Relaxed);
-                if before + matches.len() > self.max_results {
+                if before.saturating_add(matches.len()) > self.max_results {
                     state.limit_hit.store(true, Ordering::Relaxed);
                     matches.truncate(self.max_results.saturating_sub(before));
                 }
@@ -965,8 +974,8 @@ mod tests {
     /// `relative path → [(line, start column, end column)]`, sorted.
     type Results = Vec<(String, Vec<(u32, u32, u32)>)>;
 
-    fn defaults() -> ExcludeExpression {
-        crate::settings::WorkspaceSettings::default().search_excludes()
+    fn defaults() -> Settings {
+        Settings::default()
     }
 
     fn query(pattern: &str) -> TextSearchQuery {
@@ -997,7 +1006,7 @@ mod tests {
         root: &Path,
         q: &TextSearchQuery,
         skip: &HashSet<PathBuf>,
-        excludes: &ExcludeExpression,
+        excludes: &Settings,
     ) -> (Results, SearchComplete) {
         let search = TextSearch::new(root, q, excludes).unwrap();
         let found = Mutex::new(Vec::new());
@@ -1200,11 +1209,11 @@ mod tests {
         );
     }
 
-    fn settings(json: &str) -> ExcludeExpression {
-        crate::settings::WorkspaceSettings::parse(json).unwrap().search_excludes()
+    fn settings(json: &str) -> Settings {
+        Settings::parse(json).unwrap()
     }
 
-    fn found_with(root: &Path, q: &TextSearchQuery, excludes: &ExcludeExpression) -> Vec<String> {
+    fn found_with(root: &Path, q: &TextSearchQuery, excludes: &Settings) -> Vec<String> {
         files(&run_with(root, q, &HashSet::new(), excludes).0).into_iter().map(str::to_owned).collect()
     }
 
@@ -1270,5 +1279,42 @@ mod tests {
         assert!(!search.in_scope(&root.join("node_modules/other/a.js")));
         let q = TextSearchQuery { includes: "*.ts".into(), ..query("x") };
         assert!(!TextSearch::new(&root, &q, &excludes).unwrap().in_scope(&root.join("node_modules/keep/a.js")));
+    }
+
+    #[test]
+    fn ignore_file_symlink_and_limit_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = uri::canonicalize(dir.path()).unwrap();
+        std::fs::write(outer.join(".gitignore"), "parent-ignored.txt\n").unwrap();
+        let root = outer.join("project");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        for file in ["ignored.txt", "parent-ignored.txt", "a.txt", "real/b.txt"] {
+            std::fs::write(root.join(file), "hit hit").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let q = query("hit");
+        let all = found_with(&root, &q, &defaults());
+        assert!(!all.contains(&"ignored.txt".to_owned()) && all.contains(&"parent-ignored.txt".to_owned()));
+        #[cfg(unix)]
+        assert!(all.contains(&"link/b.txt".to_owned()));
+
+        let no_ignore = settings(r#"{ "search.useIgnoreFiles": false, "search.useParentIgnoreFiles": true }"#);
+        let found = found_with(&root, &q, &no_ignore);
+        assert!(found.contains(&"ignored.txt".to_owned()) && found.contains(&"parent-ignored.txt".to_owned()));
+        let parent = settings(r#"{ "search.useParentIgnoreFiles": true }"#);
+        assert!(!found_with(&root, &q, &parent).contains(&"parent-ignored.txt".to_owned()));
+        #[cfg(unix)]
+        assert!(!found_with(&root, &q, &settings(r#"{ "search.followSymlinks": false }"#))
+            .contains(&"link/b.txt".to_owned()));
+
+        let count = |s: &Settings| {
+            let (results, complete) = run_with(&root, &q, &HashSet::new(), s);
+            (results.iter().map(|(_, m)| m.len()).sum::<usize>(), complete.limit_hit)
+        };
+        assert_eq!(count(&settings(r#"{ "search.maxResults": 3 }"#)), (3, true));
+        let total = count(&defaults()).0;
+        assert_eq!(count(&settings(r#"{ "search.maxResults": null }"#)), (total, false));
     }
 }
