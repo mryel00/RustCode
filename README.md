@@ -49,6 +49,19 @@ npx tauri dev -- -- ~/my-proj     # open a folder at startup
 npx tauri build                   # release build + installers
 ```
 
+### Nix
+
+The flake (nixos-unstable) builds and runs RustCode and provides a dev shell with
+Rust, Node.js, the Tauri CLI, the Tauri system libraries and rust-analyzer:
+
+```sh
+nix run github:mryel00/RustCode      # or `nix run .` in a checkout
+nix build                            # result/bin/rustcode
+nix develop                          # then: npm install && cargo tauri dev
+```
+
+After changing `package-lock.json`, update the `npmDeps` hash in `flake.nix`.
+
 Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition,
 `Ctrl+Space` suggest, `Ctrl+Click` peek/go to definition, `Ctrl+Shift+F` search,
 `Ctrl+Shift+H` replace, `F4`/`Shift+F4` next/previous result, `Ctrl+Shift+E` explorer.
