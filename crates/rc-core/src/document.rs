@@ -336,6 +336,10 @@ impl DocumentStore {
     pub fn uris(&self) -> impl Iterator<Item = &Url> {
         self.docs.keys()
     }
+
+    pub fn documents(&self) -> impl Iterator<Item = &Document> {
+        self.docs.values()
+    }
 }
 
 #[cfg(test)]

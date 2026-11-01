@@ -3,8 +3,9 @@
 use serde::Serialize;
 use std::{io, path::Path};
 
-/// Names hidden from the explorer, matching VS Code's default `files.exclude`.
-const EXCLUDED: &[&str] = &[".git", ".svn", ".hg", "CVS", ".DS_Store", "Thumbs.db"];
+/// Names in VS Code's default `files.exclude` (`**/.git` and so on): hidden
+/// from the explorer and skipped by search.
+pub const FILES_EXCLUDE: &[&str] = &[".git", ".svn", ".hg", ".jj", ".DS_Store", "Thumbs.db"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,7 +22,7 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<DirEntry>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if EXCLUDED.contains(&name.as_str()) {
+        if FILES_EXCLUDE.contains(&name.as_str()) {
             continue;
         }
         let path = entry.path();

@@ -8,7 +8,7 @@
 use lsp_types::{FileChangeType, FileEvent, TextDocumentContentChangeEvent};
 use rc_core::{
     watcher::DEFAULT_EXCLUDES, DirEntry, DiskChange, DiskRead, DiskStamp, DocumentStore, FileChange, FileChangeKind,
-    FileWatcher, SaveOutcome, WatchEvent,
+    FileMatches, FileWatcher, SaveOutcome, TextSearch, TextSearchQuery, WatchEvent,
 };
 use rc_lsp::{LspManager, ManagerEvent};
 use serde::Serialize;
@@ -17,9 +17,10 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State};
 use url::Url;
@@ -35,6 +36,11 @@ const ALLOWED_LSP_METHODS: &[&str] = &[
 
 pub const LSP_EVENT: &str = "lsp-event";
 pub const FS_EVENT: &str = "fs-event";
+pub const SEARCH_EVENT: &str = "search-event";
+
+/// How long search results are collected before they are sent to the UI.
+const SEARCH_BATCH_INTERVAL: Duration = Duration::from_millis(50);
+const SEARCH_BATCH_FILES: usize = 200;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,6 +58,29 @@ struct Session {
     lsp: Arc<LspManager>,
     /// Set once the recursive watch is established; dropping it stops watching.
     watcher: Option<FileWatcher>,
+    /// The running text search, if any. Starting another one cancels it.
+    search: Option<ActiveSearch>,
+}
+
+struct ActiveSearch {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Text search progress for the UI. `search_id` is the id the UI chose.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum SearchEvent {
+    Results { search_id: u64, files: Vec<FileMatches> },
+    Done { search_id: u64, limit_hit: bool, cancelled: bool },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchStarted {
+    /// Open documents the query covers. The disk search skips every open
+    /// document; the UI searches these in their editors, like VS Code.
+    open_documents: Vec<String>,
 }
 
 /// File system notifications for the UI.
@@ -119,6 +148,9 @@ async fn open_workspace<R: Runtime>(app: AppHandle<R>, state: State<'_, AppState
 
     let previous = state.session.lock().unwrap().take();
     if let Some(previous) = previous {
+        if let Some(search) = &previous.search {
+            search.cancel.store(true, Ordering::Relaxed);
+        }
         previous.lsp.shutdown().await;
     }
 
@@ -140,7 +172,7 @@ async fn open_workspace<R: Runtime>(app: AppHandle<R>, state: State<'_, AppState
     };
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     *state.session.lock().unwrap() =
-        Some(Session { id, root: root.clone(), docs: DocumentStore::new(), lsp, watcher: None });
+        Some(Session { id, root: root.clone(), docs: DocumentStore::new(), lsp, watcher: None, search: None });
     start_watcher(app, id, root);
     Ok(info)
 }
@@ -346,6 +378,101 @@ async fn lsp_request(state: State<'_, AppState>, uri: String, method: String, pa
     }
 }
 
+/// Starts searching the folder for `query`. Results arrive as `search-event`s
+/// tagged with `search_id`; a running search is cancelled.
+#[tauri::command]
+async fn search_text<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    search_id: u64,
+    query: TextSearchQuery,
+) -> CmdResult<SearchStarted> {
+    let (search, skip, open_documents, cancel, session_id) = with_session(&state, |session| {
+        let search = TextSearch::new(&session.root, &query).map_err(|e| e.to_string())?;
+        let mut skip = HashSet::new();
+        let mut open_documents = Vec::new();
+        for doc in session.docs.documents() {
+            skip.insert(doc.path.clone());
+            if search.in_scope(&doc.path) {
+                open_documents.push(doc.uri.to_string());
+            }
+        }
+        if let Some(previous) = session.search.take() {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        session.search = Some(ActiveSearch { id: search_id, cancel: Arc::clone(&cancel) });
+        Ok((search, skip, open_documents, cancel, session.id))
+    })?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_search(&app, session_id, search_id, &search, &skip, &cancel);
+    });
+    Ok(SearchStarted { open_documents })
+}
+
+/// Runs a search on the current thread, sending results in batches.
+fn run_search<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: u64,
+    search_id: u64,
+    search: &TextSearch,
+    skip: &HashSet<PathBuf>,
+    cancel: &AtomicBool,
+) {
+    let (tx, rx) = mpsc::channel::<FileMatches>();
+    let forward_app = app.clone();
+    let forwarder = std::thread::spawn(move || {
+        let mut batch = Vec::new();
+        let mut last = Instant::now();
+        loop {
+            let done = match rx.recv_timeout(SEARCH_BATCH_INTERVAL.saturating_sub(last.elapsed())) {
+                Ok(file) => {
+                    batch.push(file);
+                    false
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => true,
+            };
+            if batch.is_empty() {
+                last = Instant::now();
+            } else if done || batch.len() >= SEARCH_BATCH_FILES || last.elapsed() >= SEARCH_BATCH_INTERVAL {
+                let files = std::mem::take(&mut batch);
+                let _ = forward_app.emit(SEARCH_EVENT, &SearchEvent::Results { search_id, files });
+                last = Instant::now();
+            }
+            if done {
+                break;
+            }
+        }
+    });
+    let complete = search.run(skip, cancel, |file| {
+        let _ = tx.send(file);
+    });
+    drop(tx);
+    let _ = forwarder.join();
+    let cancelled = cancel.load(Ordering::Relaxed);
+    let _ = app.emit(SEARCH_EVENT, &SearchEvent::Done { search_id, limit_hit: complete.limit_hit, cancelled });
+
+    let state = app.state::<AppState>();
+    let mut guard = state.session.lock().unwrap();
+    if let Some(session) = guard.as_mut().filter(|s| s.id == session_id)
+        && session.search.as_ref().is_some_and(|s| s.id == search_id)
+    {
+        session.search = None;
+    }
+}
+
+#[tauri::command]
+async fn cancel_search(state: State<'_, AppState>, search_id: u64) -> CmdResult<()> {
+    with_session(&state, |session| {
+        if session.search.as_ref().is_some_and(|s| s.id == search_id) {
+            let search = session.search.take().expect("checked above");
+            search.cancel.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    })
+}
+
 /// Registers RustCode's state and commands on a builder (shared with tests).
 fn setup<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.manage(AppState::default()).invoke_handler(tauri::generate_handler![
@@ -359,6 +486,8 @@ fn setup<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         accept_disk_read,
         close_document,
         lsp_request,
+        search_text,
+        cancel_search,
     ])
 }
 
@@ -487,5 +616,53 @@ mod tests {
         // Saving recreates the deleted file without a conflict.
         assert_eq!(invoke(&webview, "save_document", json!({"uri": uri})).unwrap(), "saved");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn search_streams_disk_results_and_leaves_open_documents_to_the_ui() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = rc_core::uri::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("open.txt"), "needle\n").unwrap();
+        std::fs::write(root.join("closed.txt"), "a\nneedle needle\n").unwrap();
+        std::fs::write(root.join("other.txt"), "nothing").unwrap();
+
+        let app = setup(mock_builder()).build(mock_context(noop_assets())).unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let (tx, rx) = mpsc::channel::<Value>();
+        app.listen_any(SEARCH_EVENT, move |e| {
+            let _ = tx.send(serde_json::from_str(e.payload()).unwrap());
+        });
+
+        invoke(&webview, "open_workspace", json!({"path": root})).unwrap();
+        let opened = invoke(&webview, "open_document", json!({"path": root.join("open.txt")})).unwrap();
+
+        let started = invoke(&webview, "search_text", json!({"searchId": 7, "query": {"pattern": "NEEDLE"}})).unwrap();
+        assert_eq!(started["openDocuments"], json!([opened["uri"]]));
+
+        let mut files = Vec::new();
+        let done = loop {
+            let event = rx.recv_timeout(Duration::from_secs(10)).expect("search finished");
+            assert_eq!(event["searchId"], 7);
+            match event["kind"].as_str().unwrap() {
+                "results" => files.extend(event["files"].as_array().unwrap().iter().cloned()),
+                "done" => break event,
+                other => panic!("unexpected event {other}"),
+            }
+        };
+        assert_eq!(done["limitHit"], false);
+        assert_eq!(done["cancelled"], false);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], json!(root.join("closed.txt")));
+        assert_eq!(
+            files[0]["matches"][1],
+            json!({
+                "range": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 13}},
+                "preview": {"text": "needle needle", "start": 7, "end": 13}
+            })
+        );
+
+        let err = invoke(&webview, "search_text", json!({"searchId": 8, "query": {"pattern": "(", "isRegex": true}}));
+        assert!(err.unwrap_err().as_str().unwrap().contains("unclosed group"));
+        invoke(&webview, "cancel_search", json!({"searchId": 7})).unwrap();
     }
 }

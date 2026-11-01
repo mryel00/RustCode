@@ -72,6 +72,49 @@ export type LspEvent =
   | { kind: 'showMessage'; server: string; level: string; message: string }
   | { kind: 'progress'; server: string; token: string | number; value: WorkDoneProgress };
 
+/** A search as entered in the Search view (rc-core's `TextSearchQuery`). */
+export interface TextSearchQuery {
+  pattern: string;
+  isRegex: boolean;
+  isCaseSensitive: boolean;
+  isWordMatch: boolean;
+  /** "files to include", comma separated. */
+  includes: string;
+  /** "files to exclude", comma separated. */
+  excludes: string;
+  useExcludeSettingsAndIgnoreFiles: boolean;
+  maxResults?: number;
+}
+
+/** Part of a match's first line; `start..end` (UTF-16) is the matched part. */
+export interface SearchPreview {
+  text: string;
+  start: number;
+  end: number;
+}
+
+export interface TextMatch {
+  range: L.Range;
+  preview: SearchPreview;
+  /** The full matched text, for matches spanning several lines. */
+  text?: string;
+}
+
+export interface FileMatches {
+  uri: string;
+  path: string;
+  matches: TextMatch[];
+}
+
+export type SearchEvent =
+  | { kind: 'results'; searchId: number; files: FileMatches[] }
+  | { kind: 'done'; searchId: number; limitHit: boolean; cancelled: boolean };
+
+export interface SearchStarted {
+  /** Open documents the query covers; the UI searches them in their models. */
+  openDocuments: string[];
+}
+
 export const backend = {
   initialPath: () => invoke<string | null>('initial_path'),
   openWorkspace: (path: string) => invoke<WorkspaceInfo>('open_workspace', { path }),
@@ -84,6 +127,10 @@ export const backend = {
   acceptDiskRead: (uri: string, readId: number) => invoke<void>('accept_disk_read', { uri, readId }),
   closeDocument: (uri: string) => invoke<void>('close_document', { uri }),
   lspRequest: <T>(uri: string, method: string, params: unknown) => invoke<T | null>('lsp_request', { uri, method, params }),
+  searchText: (searchId: number, query: TextSearchQuery) => invoke<SearchStarted>('search_text', { searchId, query }),
+  cancelSearch: (searchId: number) => invoke<void>('cancel_search', { searchId }),
+  onSearchEvent: (handler: (event: SearchEvent) => void): Promise<UnlistenFn> =>
+    listen<SearchEvent>('search-event', (e) => handler(e.payload)),
   onLspEvent: (handler: (event: LspEvent) => void): Promise<UnlistenFn> =>
     listen<LspEvent>('lsp-event', (e) => handler(e.payload)),
   onFsEvent: (handler: (event: FsEvent) => void): Promise<UnlistenFn> =>

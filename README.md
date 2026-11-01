@@ -10,6 +10,11 @@ highlighting, save, plus LSP completion, hover, go-to-definition and diagnostics
 files are marked in their tab, saving over a newer file asks before overwriting, the
 explorer updates itself, and language servers get `workspace/didChangeWatchedFiles`.
 
+**Search:** Find in Files and Replace in Files as in VS Code: match case, whole word,
+regex (with look-around), preserve case, files to include/exclude, `.gitignore` and the
+default excludes, unsaved changes in open files, results that follow your edits, and
+replace one match, one file or everything.
+
 ## Requirements
 
 - Rust 1.88+ (edition 2024) and Node.js 20+
@@ -37,7 +42,8 @@ npx tauri build                   # release build + installers
 ```
 
 Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition,
-`Ctrl+Space` suggest, `Ctrl+Click` peek/go to definition.
+`Ctrl+Space` suggest, `Ctrl+Click` peek/go to definition, `Ctrl+Shift+F` search,
+`Ctrl+Shift+H` replace, `F4`/`Shift+F4` next/previous result, `Ctrl+Shift+E` explorer.
 
 ## Test
 
@@ -50,7 +56,7 @@ npm run build            # type-checks and bundles the UI
 ## Layout
 
 ```
-crates/rc-core   text model (ropes, UTF-16 positions), documents, file system, languages
+crates/rc-core   text model (ropes, UTF-16 positions), documents, file system, watcher, search
 crates/rc-lsp    LSP framing, client, per-language server manager
 src-tauri        Tauri app: commands + event bridge between UI and the crates
 src              UI: Monaco setup, workbench (explorer, tabs, status bar), LSP adapters

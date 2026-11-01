@@ -8,6 +8,9 @@ import { Documents, type Doc } from './workbench/documents';
 import { EditorGroup } from './workbench/editor-group';
 import { Explorer } from './workbench/explorer';
 import { initSash } from './workbench/sash';
+import { SearchModel, toMonacoRange } from './workbench/search/search-model';
+import { SearchView } from './workbench/search/search-view';
+import { Sidebar } from './workbench/sidebar';
 import { StatusBar, toast } from './workbench/statusbar';
 
 const $ = (id: string) => document.getElementById(id)!;
@@ -17,6 +20,15 @@ const features = new LanguageFeatures(docs);
 const group = new EditorGroup(docs, $('tabs'), $('editor'), $('welcome'));
 const explorer = new Explorer($('explorer'));
 const statusBar = new StatusBar(features);
+const sidebar = new Sidebar($('activitybar'), $('sidebar'), $('sash'), {
+  explorer: $('view-explorer'),
+  search: $('view-search'),
+});
+const searchModel = new SearchModel({ docs, save: (doc) => save(doc), isShown: (doc) => group.isShown(doc) });
+const searchView = new SearchView($('search-view'), $('search-actions'), searchModel, {
+  confirm: (text, okLabel) => ask(text, { title: 'Replace All', kind: 'warning', okLabel, cancelLabel: 'Cancel' }),
+  report: (text) => toast(text, 'error'),
+});
 const appWindow = getCurrentWindow();
 let workspaceName: string | null = null;
 
@@ -67,12 +79,43 @@ explorer.onOpenFile.on((path) => {
   docs.open({ path }).then((doc) => group.show(doc), report);
 });
 
+sidebar.onDidChangeView.on((view) => searchView.setVisible(view === 'search'));
+searchView.onOpenFolder.on(() => void pickFolder());
+searchView.onOpenFile.on((file) => {
+  docs.open({ uri: file.uri }).then((doc) => group.show(doc), report);
+});
+searchView.onOpenMatch.on(({ file, match, preserveFocus }) => {
+  docs.open({ uri: file.uri }).then((doc) => {
+    group.show(doc, { preserveFocus });
+    const range = toMonacoRange(match.range);
+    group.editor.setSelection(range);
+    group.editor.revealRangeInCenterIfOutsideViewport(range);
+    searchModel.setCurrent(file, match);
+  }, report);
+});
+
+/** A single-line selection in the editor, to seed the search with (VS Code's default). */
+function selectedText(): string | undefined {
+  const model = group.editor.getModel();
+  const selection = group.editor.getSelection();
+  if (!model || !selection || selection.isEmpty() || selection.startLineNumber !== selection.endLineNumber) return undefined;
+  return model.getValueInRange(selection);
+}
+
+function showSearch(replace: boolean): void {
+  const seed = selectedText();
+  sidebar.show('search');
+  searchView.focus({ seed, replace });
+}
+
 async function openWorkspace(path: string): Promise<void> {
   if (!(await group.closeAll())) return;
   features.reset();
   try {
     const info = await backend.openWorkspace(path);
     workspaceName = info.name;
+    searchModel.setRoot(info.root);
+    searchView.setWorkspace(true);
     $('workspace-name').textContent = info.name;
     $('workspace-name').title = info.root;
     document.body.classList.add('has-workspace');
@@ -119,8 +162,26 @@ window.addEventListener(
   'keydown',
   (e) => {
     const mod = e.ctrlKey || e.metaKey;
+    // F4 / Shift+F4: next / previous search result.
+    if (e.key === 'F4' && !mod && !e.altKey && searchView.hasResults) {
+      e.preventDefault();
+      e.stopPropagation();
+      searchView.navigate(e.shiftKey ? -1 : 1);
+      return;
+    }
     if (!mod || e.altKey) return;
     const key = e.key.toLowerCase();
+    if (e.shiftKey && (key === 'f' || key === 'h' || key === 'e')) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (key === 'e') {
+        sidebar.show('explorer');
+        $('explorer').querySelector<HTMLElement>('.tree-row.active, .tree-row')?.focus();
+      } else {
+        showSearch(key === 'h');
+      }
+      return;
+    }
     if (key === 's' && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
@@ -162,4 +223,4 @@ void backend.initialPath().then((path) => {
 });
 
 // Exposed for debugging from the devtools console.
-Object.assign(window, { rustcode: { monaco, docs, group, features, explorer, revertActive } });
+Object.assign(window, { rustcode: { monaco, docs, group, features, explorer, searchModel, revertActive } });

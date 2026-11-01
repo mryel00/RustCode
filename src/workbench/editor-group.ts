@@ -68,7 +68,12 @@ export class EditorGroup {
     return this.active;
   }
 
-  show(doc: Doc): void {
+  /** Whether the document has a tab. */
+  isShown(doc: Doc): boolean {
+    return this.tabs.includes(doc);
+  }
+
+  show(doc: Doc, { preserveFocus = false }: { preserveFocus?: boolean } = {}): void {
     if (!this.tabs.includes(doc)) {
       const at = this.active ? this.tabs.indexOf(this.active) + 1 : this.tabs.length;
       this.tabs.splice(at, 0, doc);
@@ -82,7 +87,7 @@ export class EditorGroup {
       this.onDidChangeActive.fire(doc);
     }
     this.renderTabs();
-    this.editor.focus();
+    if (!preserveFocus) this.editor.focus();
   }
 
   /** Closes a tab, asking first if it has unsaved changes. Returns false if cancelled. */

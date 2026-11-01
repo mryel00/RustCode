@@ -7,16 +7,29 @@
   </head>
   <body>
     <div id="workbench">
+      <nav id="activitybar" class="activitybar" aria-label="Views">
+        <button class="activity codicon codicon-files" data-view="explorer" title="Explorer (Ctrl+Shift+E)"></button>
+        <button class="activity codicon codicon-search" data-view="search" title="Search (Ctrl+Shift+F)"></button>
+      </nav>
       <aside id="sidebar">
-        <header class="sidebar-title">
-          <span>Explorer</span>
-          <span class="sidebar-actions">
-            <button id="refresh-explorer" class="icon-button codicon codicon-refresh" title="Refresh Explorer"></button>
-            <button id="open-folder" class="icon-button codicon codicon-folder-opened" title="Open Folder (Ctrl+O)"></button>
-          </span>
-        </header>
-        <div id="workspace-name" class="workspace-name"></div>
-        <div id="explorer" class="explorer" role="tree"></div>
+        <section id="view-explorer" class="view">
+          <header class="sidebar-title">
+            <span>Explorer</span>
+            <span class="sidebar-actions">
+              <button id="refresh-explorer" class="icon-button codicon codicon-refresh" title="Refresh Explorer"></button>
+              <button id="open-folder" class="icon-button codicon codicon-folder-opened" title="Open Folder (Ctrl+O)"></button>
+            </span>
+          </header>
+          <div id="workspace-name" class="workspace-name"></div>
+          <div id="explorer" class="explorer" role="tree"></div>
+        </section>
+        <section id="view-search" class="view" hidden>
+          <header class="sidebar-title">
+            <span>Search</span>
+            <span id="search-actions" class="sidebar-actions"></span>
+          </header>
+          <div id="search-view"></div>
+        </section>
       </aside>
       <div id="sash" class="sash" role="separator" aria-orientation="vertical"></div>
       <main id="main">
@@ -31,6 +44,7 @@
               <li><kbd>Ctrl</kbd>+<kbd>O</kbd> Open Folder</li>
               <li><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</li>
               <li><kbd>Ctrl</kbd>+<kbd>W</kbd> Close Editor</li>
+              <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> Search in Files</li>
               <li><kbd>F12</kbd> Go to Definition</li>
               <li><kbd>Ctrl</kbd>+<kbd>Space</kbd> Trigger Suggest</li>
             </ul>
