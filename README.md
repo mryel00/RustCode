@@ -15,10 +15,15 @@ regex (with look-around), preserve case, files to include/exclude, `.gitignore` 
 default excludes, unsaved changes in open files, results that follow your edits, and
 replace one match, one file or everything.
 
+**Rename:** `F2` renames a symbol across files through the language server, as in
+VS Code (prepare rename, placeholders, `files.refactoring.autoSave`). Language
+servers can edit documents themselves (`workspace/applyEdit`).
+
 **Settings:** read from VS Code's own files: your VS Code user settings, then the
 folder's `.vscode/settings.json`, and they reload when either changes. Supported:
 `files.exclude` and `search.exclude` (with `!` exclude exceptions such as
 `"!node_modules/mylib": true` and `when` sibling clauses), `files.watcherExclude`,
+`files.refactoring.autoSave`,
 the `search.*` ignore-file, symlink, smart case, max results, search-on-type and
 seeding settings, and `editor.find.seedSearchStringFromSelection`. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#settings).
@@ -62,7 +67,7 @@ nix develop                          # then: npm install && cargo tauri dev
 
 After changing `package-lock.json`, update the `npmDeps` hash in `flake.nix`.
 
-Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition,
+Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition, `F2` rename,
 `Ctrl+Space` suggest, `Ctrl+Click` peek/go to definition, `Ctrl+Shift+F` search,
 `Ctrl+Shift+H` replace, `F4`/`Shift+F4` next/previous result, `Ctrl+Shift+E` explorer.
 

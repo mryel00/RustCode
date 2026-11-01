@@ -7,11 +7,11 @@ use crate::{
 use lsp_types::{
     notification::Notification, request::Request, ClientCapabilities, ClientInfo,
     CompletionClientCapabilities, CompletionItemCapability, CompletionItemCapabilityResolveSupport,
-    DiagnosticTag, DidChangeWatchedFilesClientCapabilities, FileEvent, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
-    InitializeParams, InitializeResult, MarkupKind, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, SignatureHelpClientCapabilities,
-    TagSupport, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
-    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceFolder,
+    DiagnosticTag, DidChangeWatchedFilesClientCapabilities, FailureHandlingKind, FileEvent, GeneralClientCapabilities,
+    GotoCapability, HoverClientCapabilities, InitializeParams, InitializeResult, MarkupKind, PositionEncodingKind,
+    PrepareSupportDefaultBehavior, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
+    SignatureHelpClientCapabilities, TagSupport, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
+    WindowClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 use serde_json::{json, Value};
 use std::{
@@ -32,7 +32,12 @@ use tokio::{
 use url::Url;
 
 const METHOD_NOT_FOUND: i64 = -32601;
+const INTERNAL_ERROR: i64 = -32603;
 const REQUEST_CANCELLED: i64 = -32800;
+
+/// Server-to-client requests the client cannot answer itself: they arrive as
+/// [`Incoming::Request`] and are answered with [`LspClient::reply`].
+const FORWARDED_REQUESTS: &[&str] = &["workspace/applyEdit"];
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LspError {
@@ -62,6 +67,9 @@ impl LspError {
 #[derive(Debug)]
 pub enum Incoming {
     Notification { method: String, params: Value },
+    /// A request only the editor can answer (see `FORWARDED_REQUESTS`);
+    /// answer it with [`LspClient::reply`] and this `id`.
+    Request { id: Value, method: String, params: Value },
     Stderr(String),
     /// The process exited. Always the last event.
     Exited(Option<i32>),
@@ -223,6 +231,16 @@ impl LspClient {
         self.notify_value(N::METHOD, serde_json::to_value(params).expect("params serialize"))
     }
 
+    /// Answers a request from the server ([`Incoming::Request`]): `Ok` with
+    /// the result, `Err` with an error message.
+    pub fn reply(&self, id: Value, result: Result<Value, String>) -> Result<(), LspError> {
+        let msg = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(message) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": INTERNAL_ERROR, "message": message}}),
+        };
+        self.inner.outgoing.send(encode_message(&msg)).map_err(|_| LspError::ServerExited)
+    }
+
     /// The file events the server registered interest in through
     /// `workspace/didChangeWatchedFiles`.
     pub fn watched_file_events(&self, changes: &[FileEvent]) -> Vec<FileEvent> {
@@ -289,6 +307,10 @@ async fn read_loop(stdout: ChildStdout, inner: Arc<Inner>, events: mpsc::Unbound
             // Request from the server.
             (Some(method), Some(id)) => {
                 let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                if FORWARDED_REQUESTS.contains(&method.as_str()) {
+                    let _ = events.send(Incoming::Request { id, method, params });
+                    continue;
+                }
                 let reply = match answer_server_request(&method, &params, &inner) {
                     Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
                     Err(message) => json!({"jsonrpc": "2.0", "id": id,
@@ -367,7 +389,6 @@ fn answer_server_request(method: &str, params: &Value, inner: &Inner) -> Result<
         | "workspace/semanticTokens/refresh"
         | "workspace/inlayHint/refresh"
         | "workspace/codeLens/refresh" => Ok(Value::Null),
-        "workspace/applyEdit" => Ok(json!({"applied": false, "failureReason": "not supported yet"})),
         _ => Err(format!("unhandled method {method}")),
     }
 }
@@ -382,6 +403,16 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         window: Some(WindowClientCapabilities { work_done_progress: Some(true), ..Default::default() }),
         workspace: Some(WorkspaceClientCapabilities {
+            apply_edit: Some(true),
+            // Like vscode-languageclient, minus resource operations (creating,
+            // renaming and deleting files) and change annotations, which
+            // RustCode does not support yet.
+            workspace_edit: Some(WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                failure_handling: Some(FailureHandlingKind::TextOnlyTransactional),
+                normalizes_line_endings: Some(true),
+                ..Default::default()
+            }),
             configuration: Some(true),
             workspace_folders: Some(true),
             did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
@@ -414,6 +445,11 @@ fn client_capabilities() -> ClientCapabilities {
             hover: Some(HoverClientCapabilities { content_format: Some(markup.clone()), ..Default::default() }),
             signature_help: Some(SignatureHelpClientCapabilities::default()),
             definition: Some(GotoCapability { link_support: Some(true), ..Default::default() }),
+            rename: Some(RenameClientCapabilities {
+                prepare_support: Some(true),
+                prepare_support_default_behavior: Some(PrepareSupportDefaultBehavior::IDENTIFIER),
+                ..Default::default()
+            }),
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 related_information: Some(true),
                 version_support: Some(true),

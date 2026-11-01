@@ -30,7 +30,10 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -42,7 +45,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ServerStatus {
     Starting,
-    Ready { name: String, languages: Vec<String>, completion_trigger_characters: Vec<String> },
+    /// `capabilities`: the server's `ServerCapabilities`, as it sent them.
+    Ready { name: String, languages: Vec<String>, completion_trigger_characters: Vec<String>, capabilities: Value },
     NotInstalled { command: String },
     Failed { message: String },
     /// The server went away on its own. `restarting`: a new process is being
@@ -58,7 +62,22 @@ pub enum ManagerEvent {
     Log { server: String, level: &'static str, message: String },
     ShowMessage { server: String, level: &'static str, message: String },
     Progress { server: String, token: Value, value: Value },
+    /// A request from the server for the editor (`workspace/applyEdit`).
+    /// Answer it with [`LspManager::reply`] and this `id`.
+    Request { server: String, id: u64, method: String, params: Value },
 }
+
+/// A server request waiting for the editor's answer.
+struct PendingRequest {
+    server: String,
+    /// The process that asked; a restarted server never gets the answer.
+    client: LspClient,
+    id: Value,
+}
+
+type PendingRequests = Arc<Mutex<HashMap<u64, PendingRequest>>>;
+
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 enum Cmd {
     Open { uri: Url, language_id: String, version: i32, text: String },
@@ -67,6 +86,9 @@ enum Cmd {
     Close { uri: Url },
     FilesChanged { changes: Vec<FileEvent> },
     Request { method: String, params: Value, reply: oneshot::Sender<Result<Value, LspError>> },
+    /// The editor's answer to a server request. Sent through the queue so it
+    /// reaches the server after the edits made while answering.
+    Reply { client: LspClient, id: Value, result: Result<Value, String> },
     Restart,
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -79,6 +101,7 @@ pub struct LspManager {
     /// Which server each open document was sent to.
     docs: Mutex<HashMap<Url, String>>,
     events: mpsc::UnboundedSender<ManagerEvent>,
+    pending: PendingRequests,
 }
 
 impl LspManager {
@@ -90,6 +113,7 @@ impl LspManager {
             servers: Mutex::default(),
             docs: Mutex::default(),
             events,
+            pending: PendingRequests::default(),
         }
     }
 
@@ -146,6 +170,16 @@ impl LspManager {
         rx.await.unwrap_or(Err(LspError::ServerExited))
     }
 
+    /// Answers a [`ManagerEvent::Request`]. The answer reaches the server
+    /// after every document change sent before this call. Returns false when
+    /// the request is unknown or its server process has gone away.
+    pub fn reply(&self, id: u64, result: Result<Value, String>) -> bool {
+        let Some(pending) = self.pending.lock().unwrap().remove(&id) else { return false };
+        let servers = self.servers.lock().unwrap();
+        let cmd = Cmd::Reply { client: pending.client, id: pending.id, result };
+        servers.get(&pending.server).is_some_and(|tx| tx.send(cmd).is_ok())
+    }
+
     /// Stops the server (gracefully) and starts it again with every open
     /// document, also when it had failed or crashed too often. Returns false
     /// when that server has not been started in this workspace.
@@ -162,6 +196,7 @@ impl LspManager {
     pub async fn shutdown(&self) {
         let senders: Vec<_> = self.servers.lock().unwrap().drain().map(|(_, tx)| tx).collect();
         self.docs.lock().unwrap().clear();
+        self.pending.lock().unwrap().clear();
         let mut waits = Vec::new();
         for tx in senders {
             let (done, rx) = oneshot::channel();
@@ -187,7 +222,8 @@ impl LspManager {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         servers.insert(config.id.clone(), tx.clone());
-        tokio::spawn(run_server(config.clone(), self.root.clone(), self.root_path.clone(), rx, self.events.clone()));
+        let events = Events { server: config.id.clone(), tx: self.events.clone(), pending: Arc::clone(&self.pending) };
+        tokio::spawn(run_server(config.clone(), self.root.clone(), self.root_path.clone(), rx, events));
         tx
     }
 }
@@ -197,12 +233,10 @@ async fn run_server(
     root: Url,
     root_path: PathBuf,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
-    events: mpsc::UnboundedSender<ManagerEvent>,
+    events: Events,
 ) {
     let id = config.id.clone();
-    let status = |status: ServerStatus| {
-        let _ = events.send(ManagerEvent::Status { server: id.clone(), status });
-    };
+    let status = |status: ServerStatus| events.send(ManagerEvent::Status { server: id.clone(), status });
     // Survive restarts: the documents the server should have open, and the
     // commands that arrived while it was starting.
     let mut mirrors: HashMap<Url, Mirror> = HashMap::new();
@@ -230,6 +264,7 @@ async fn run_server(
                 .as_ref()
                 .and_then(|c| c.trigger_characters.clone())
                 .unwrap_or_default(),
+            capabilities: serde_json::to_value(&*caps).unwrap_or(Value::Null),
         });
 
         let sync = SyncInfo::from(&*caps);
@@ -256,6 +291,7 @@ async fn run_server(
                     match cmd {
                         Some(Cmd::Shutdown { done }) => {
                             client.shutdown().await;
+                            events.drop_requests();
                             let _ = done.send(());
                             return;
                         }
@@ -268,6 +304,7 @@ async fn run_server(
                         Some(cmd) => handle(cmd, &client, &caps, &sync, &mut mirrors),
                         None => {
                             client.shutdown().await;
+                            events.drop_requests();
                             return;
                         }
                     }
@@ -275,24 +312,26 @@ async fn run_server(
                 event = incoming.recv() => match event {
                     Some(Incoming::Exited(code)) => break Some(code),
                     None => break Some(None),
-                    Some(event) => forward(&id, event, &events),
+                    Some(event) => events.forward(&client, event),
                 }
             }
         };
+        // Requests of the old process can no longer be answered.
+        events.drop_requests();
         let Some(code) = code else { continue };
 
         // The server went away without being asked to: restart it unless it
         // keeps crashing (vscode-languageclient's DefaultErrorHandler.closed).
         if restarts.closed(Instant::now()) {
             let message = "Connection to server got closed. Server will restart.".to_owned();
-            let _ = events.send(ManagerEvent::Log { server: id.clone(), level: "info", message: message.clone() });
+            events.send(ManagerEvent::Log { server: id.clone(), level: "info", message: message.clone() });
             status(ServerStatus::Exited { code, restarting: true, message });
         } else {
             let message = format!(
                 "The {id} server crashed {} times in the last 3 minutes. The server will not be restarted.",
                 MAX_RESTART_COUNT + 1
             );
-            let _ = events.send(ManagerEvent::Log { server: id.clone(), level: "error", message: message.clone() });
+            events.send(ManagerEvent::Log { server: id.clone(), level: "error", message: message.clone() });
             status(ServerStatus::Exited { code, restarting: false, message: message.clone() });
             if !stopped(&mut queued, &mut rx, &mut mirrors, &message).await {
                 return;
@@ -319,7 +358,7 @@ async fn start(
     root_path: &Path,
     rx: &mut mpsc::UnboundedReceiver<Cmd>,
     queued: &mut VecDeque<Cmd>,
-    events: &mpsc::UnboundedSender<ManagerEvent>,
+    events: &Events,
 ) -> Started {
     let Ok(program) = which::which(&config.command) else {
         let reason = format!("{} is not installed", config.command);
@@ -345,21 +384,24 @@ async fn start(
                     {
                         first_stderr = Some(line.trim().to_owned());
                     }
-                    forward(&config.id, event, events);
+                    events.forward(&client, event);
                 }
                 cmd = rx.recv() => match cmd {
                     Some(Cmd::Shutdown { done }) => {
                         client.kill().await;
+                        events.drop_requests();
                         let _ = done.send(());
                         return Started::ShutDown;
                     }
                     Some(Cmd::Restart) => {
                         client.kill().await;
+                        events.drop_requests();
                         return Started::Restart;
                     }
                     Some(cmd) => queued.push_back(cmd),
                     None => {
                         client.kill().await;
+                        events.drop_requests();
                         return Started::ShutDown;
                     }
                 },
@@ -374,6 +416,7 @@ async fn start(
                 None => e.to_string(),
             };
             client.shutdown().await;
+            events.drop_requests();
             Started::Failed(ServerStatus::Failed { message }, e.to_string())
         }
     }
@@ -413,7 +456,7 @@ async fn stopped(
             Cmd::Request { reply, .. } => {
                 let _ = reply.send(Err(LspError::Unavailable(reason.to_owned())));
             }
-            Cmd::Save { .. } | Cmd::FilesChanged { .. } => {}
+            Cmd::Save { .. } | Cmd::FilesChanged { .. } | Cmd::Reply { .. } => {}
             Cmd::Restart => return true,
             Cmd::Shutdown { done } => {
                 let _ = done.send(());
@@ -523,38 +566,66 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
                 }
             }
         }
+        Cmd::Reply { client, id, result } => {
+            let _ = client.reply(id, result);
+        }
         Cmd::Restart | Cmd::Shutdown { .. } => unreachable!("handled by run_server"),
     }
 }
 
-fn forward(server: &str, event: Incoming, events: &mpsc::UnboundedSender<ManagerEvent>) {
-    let server = server.to_owned();
-    let event = match event {
-        Incoming::Notification { method, params } => match method.as_str() {
-            "textDocument/publishDiagnostics" => match serde_json::from_value::<PublishDiagnosticsParams>(params) {
-                Ok(p) => ManagerEvent::Diagnostics { server, uri: p.uri, version: p.version, diagnostics: p.diagnostics },
-                Err(e) => ManagerEvent::Log { server, level: "error", message: format!("bad diagnostics: {e}") },
-            },
-            "window/logMessage" | "window/showMessage" => {
-                let level = message_level(&params);
-                let message = params.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
-                if method == "window/logMessage" {
-                    ManagerEvent::Log { server, level, message }
-                } else {
-                    ManagerEvent::ShowMessage { server, level, message }
+/// Where a server task reports to.
+struct Events {
+    server: String,
+    tx: mpsc::UnboundedSender<ManagerEvent>,
+    pending: PendingRequests,
+}
+
+impl Events {
+    fn send(&self, event: ManagerEvent) {
+        let _ = self.tx.send(event);
+    }
+
+    /// Passes on what `client`'s process sent.
+    fn forward(&self, client: &LspClient, event: Incoming) {
+        let server = self.server.clone();
+        let event = match event {
+            Incoming::Notification { method, params } => match method.as_str() {
+                "textDocument/publishDiagnostics" => match serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                    Ok(p) => ManagerEvent::Diagnostics { server, uri: p.uri, version: p.version, diagnostics: p.diagnostics },
+                    Err(e) => ManagerEvent::Log { server, level: "error", message: format!("bad diagnostics: {e}") },
+                },
+                "window/logMessage" | "window/showMessage" => {
+                    let level = message_level(&params);
+                    let message = params.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    if method == "window/logMessage" {
+                        ManagerEvent::Log { server, level, message }
+                    } else {
+                        ManagerEvent::ShowMessage { server, level, message }
+                    }
                 }
-            }
-            "$/progress" => ManagerEvent::Progress {
-                server,
-                token: params.get("token").cloned().unwrap_or(Value::Null),
-                value: params.get("value").cloned().unwrap_or(Value::Null),
+                "$/progress" => ManagerEvent::Progress {
+                    server,
+                    token: params.get("token").cloned().unwrap_or(Value::Null),
+                    value: params.get("value").cloned().unwrap_or(Value::Null),
+                },
+                _ => return,
             },
-            _ => return,
-        },
-        Incoming::Stderr(line) => ManagerEvent::Log { server, level: "log", message: line },
-        Incoming::Exited(_) => return,
-    };
-    let _ = events.send(event);
+            Incoming::Request { id, method, params } => {
+                let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                let pending = PendingRequest { server: server.clone(), client: client.clone(), id };
+                self.pending.lock().unwrap().insert(request_id, pending);
+                ManagerEvent::Request { server, id: request_id, method, params }
+            }
+            Incoming::Stderr(line) => ManagerEvent::Log { server, level: "log", message: line },
+            Incoming::Exited(_) => return,
+        };
+        self.send(event);
+    }
+
+    /// Forgets the requests of a server process that has gone away.
+    fn drop_requests(&self) {
+        self.pending.lock().unwrap().retain(|_, p| p.server != self.server);
+    }
 }
 
 fn message_level(params: &Value) -> &'static str {
@@ -604,6 +675,10 @@ fn supports(caps: &ServerCapabilities, method: &str) -> bool {
         "textDocument/hover" => !matches!(caps.hover_provider, None | Some(HoverProviderCapability::Simple(false))),
         "textDocument/definition" => !matches!(caps.definition_provider, None | Some(OneOf::Left(false))),
         "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
+        "textDocument/rename" => !matches!(caps.rename_provider, None | Some(OneOf::Left(false))),
+        "textDocument/prepareRename" => {
+            matches!(&caps.rename_provider, Some(OneOf::Right(options)) if options.prepare_provider == Some(true))
+        }
         _ => true,
     }
 }

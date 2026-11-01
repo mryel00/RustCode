@@ -2,8 +2,9 @@ import './styles.css';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { ask, message, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { backend, DEFAULT_UI_SETTINGS, errorMessage, type UiSettings } from './backend';
+import { BulkEdits, type ApplyWorkspaceEditParams } from './lsp/bulk-edit';
 import { LanguageFeatures } from './lsp/features';
-import { monaco } from './monaco/setup';
+import { monaco, setBulkEditHandler, setNotificationHandler } from './monaco/setup';
 import { Documents, type Doc } from './workbench/documents';
 import { EditorGroup } from './workbench/editor-group';
 import { Explorer } from './workbench/explorer';
@@ -32,6 +33,14 @@ const searchView = new SearchView($('search-view'), $('search-actions'), searchM
 const appWindow = getCurrentWindow();
 let workspaceName: string | null = null;
 let uiSettings: UiSettings = DEFAULT_UI_SETTINGS;
+const bulkEdits = new BulkEdits(docs, {
+  editor: group.editor,
+  isShown: (doc) => group.isShown(doc),
+  save: (doc) => save(doc),
+  refactoringAutoSave: () => uiSettings.refactoringAutoSave,
+});
+setBulkEditHandler((edits, options) => bulkEdits.apply(edits, options));
+setNotificationHandler((message, level) => toast(message, level));
 
 function applySettings(settings: UiSettings): void {
   uiSettings = settings;
@@ -60,6 +69,16 @@ features.onMessage.on(({ level, message }) =>
   toast(message, level === 'error' ? 'error' : level === 'warning' ? 'warning' : 'info'),
 );
 void backend.onLspEvent((event) => features.handle(event));
+features.onServerRequest.on(({ id, method, params }) => {
+  const answer: Promise<{ result: unknown } | { error: string }> =
+    method === 'workspace/applyEdit'
+      ? bulkEdits.applyServerEdit(params as ApplyWorkspaceEditParams).then((result) => ({ result }))
+      : Promise.resolve({ error: `unhandled method ${method}` });
+  void answer
+    .catch((err) => ({ error: errorMessage(err) }))
+    .then((a) => backend.lspReply(id, a))
+    .catch((err) => console.warn('could not answer the language server:', errorMessage(err)));
+});
 void backend.onFsEvent((event) => {
   switch (event.kind) {
     case 'changes':
@@ -262,4 +281,4 @@ void backend.initialPath().then((path) => {
 });
 
 // Exposed for debugging from the devtools console.
-Object.assign(window, { rustcode: { monaco, docs, group, features, explorer, searchModel, revertActive } });
+Object.assign(window, { rustcode: { monaco, docs, group, features, explorer, searchModel, bulkEdits, revertActive } });

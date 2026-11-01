@@ -2,6 +2,9 @@
 
 - `fake/state` answers with this process's id and the documents it has open.
 - `fake/exit` makes the process exit at once with code 3, without answering.
+- `fake/applyEdit` sends its params as a `workspace/applyEdit` request to the
+  client; `fake/state` lists the answers with the document versions the server
+  had when each answer arrived.
 - `--slow-init` never answers `initialize`.
 """
 
@@ -11,6 +14,8 @@ import sys
 
 slow_init = "--slow-init" in sys.argv
 docs = {}
+capabilities = {}
+replies = []
 
 
 def read():
@@ -37,7 +42,12 @@ def send(msg):
 while True:
     msg = read()
     method, params, id_ = msg.get("method"), msg.get("params"), msg.get("id")
-    if method == "initialize":
+    if method is None and id_ is not None:
+        # The client's answer to one of our requests.
+        versions = {uri: d["version"] for uri, d in docs.items()}
+        replies.append({"id": id_, "result": msg.get("result"), "error": msg.get("error"), "versions": versions})
+    elif method == "initialize":
+        capabilities = params["capabilities"]
         if not slow_init:
             send({"jsonrpc": "2.0", "id": id_, "result": {"capabilities": {"textDocumentSync": 1}}})
     elif method == "textDocument/didOpen":
@@ -49,7 +59,11 @@ while True:
     elif method == "textDocument/didClose":
         docs.pop(params["textDocument"]["uri"], None)
     elif method == "fake/state":
-        send({"jsonrpc": "2.0", "id": id_, "result": {"pid": os.getpid(), "docs": docs}})
+        send({"jsonrpc": "2.0", "id": id_, "result": {
+            "pid": os.getpid(), "docs": docs, "capabilities": capabilities, "replies": replies}})
+    elif method == "fake/applyEdit":
+        send({"jsonrpc": "2.0", "id": "edit-%d" % len(replies), "method": "workspace/applyEdit", "params": params})
+        send({"jsonrpc": "2.0", "id": id_, "result": None})
     elif method == "fake/exit":
         os._exit(3)
     elif method == "shutdown":

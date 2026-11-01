@@ -152,6 +152,21 @@ async fn rust_analyzer_end_to_end() {
     let hover = request_until(&mgr, &uri, "textDocument/hover", helper_params, |v| v.to_string().contains("-> u64")).await;
     assert!(hover.to_string().contains("fn helper() -> u64"), "hover: {hover}");
 
+    // Rename across files: we announce `documentChanges`, so the edit is
+    // versioned for the open document and unversioned for the other file.
+    let position = json!({"textDocument": {"uri": uri}, "position": {"line": 11, "character": 12}});
+    let prepared = request_until(&mgr, &uri, "textDocument/prepareRename", position.clone(), |v| !v.is_null()).await;
+    let range = prepared.get("range").unwrap_or(&prepared);
+    assert_eq!(range, &json!({"start": {"line": 11, "character": 10}, "end": {"line": 11, "character": 16}}));
+    let mut rename_params = position;
+    rename_params["newName"] = json!("assist");
+    let edit = request_until(&mgr, &uri, "textDocument/rename", rename_params, |v| !v.is_null()).await;
+    let changes = edit["documentChanges"].as_array().unwrap_or_else(|| panic!("documentChanges: {edit}"));
+    let for_file = |u: &Url| changes.iter().find(|c| c["textDocument"]["uri"] == json!(u)).unwrap_or_else(|| panic!("{edit}"));
+    assert_eq!(for_file(&uri)["textDocument"]["version"], json!(2));
+    assert_eq!(for_file(&util_uri)["textDocument"]["version"], Value::Null);
+    assert!(for_file(&util_uri)["edits"].to_string().contains("\"assist\""), "{edit}");
+
     mgr.close(&uri);
     mgr.shutdown().await;
     events

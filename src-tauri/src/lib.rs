@@ -34,6 +34,8 @@ const ALLOWED_LSP_METHODS: &[&str] = &[
     "textDocument/hover",
     "textDocument/definition",
     "textDocument/signatureHelp",
+    "textDocument/prepareRename",
+    "textDocument/rename",
 ];
 
 pub const LSP_EVENT: &str = "lsp-event";
@@ -480,6 +482,19 @@ async fn lsp_request(state: State<'_, AppState>, uri: String, method: String, pa
     }
 }
 
+/// Answers a request a language server sent to the editor (an `lsp-event`
+/// of kind `request`): with `result`, or with `error` as an error message.
+/// Fails when the request is unknown or its server has gone away.
+#[tauri::command]
+async fn lsp_reply(state: State<'_, AppState>, id: u64, result: Option<Value>, error: Option<String>) -> CmdResult<()> {
+    let lsp = with_session(&state, |s| Ok(Arc::clone(&s.lsp)))?;
+    let result = match error {
+        Some(error) => Err(error),
+        None => Ok(result.unwrap_or(Value::Null)),
+    };
+    if lsp.reply(id, result) { Ok(()) } else { Err("the language server is no longer waiting for this answer".into()) }
+}
+
 /// Restarts a language server of the open folder, named directly or as the
 /// server of document `uri` (like the "Restart Server" commands VS Code's
 /// language extensions add). Returns the server's name.
@@ -611,6 +626,7 @@ fn setup<R: Runtime>(builder: tauri::Builder<R>, state: AppState) -> tauri::Buil
         accept_disk_read,
         close_document,
         lsp_request,
+        lsp_reply,
         restart_language_server,
         search_text,
         cancel_search,

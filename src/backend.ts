@@ -13,6 +13,8 @@ export interface UiSettings {
   searchOnTypeDebouncePeriod: number;
   seedWithNearestWord: boolean;
   seedSearchStringFromSelection: 'never' | 'always' | 'selection';
+  /** `files.refactoring.autoSave`. */
+  refactoringAutoSave: boolean;
 }
 
 /** VS Code's defaults, until a folder's settings are loaded. */
@@ -23,6 +25,7 @@ export const DEFAULT_UI_SETTINGS: UiSettings = {
   searchOnTypeDebouncePeriod: 300,
   seedWithNearestWord: false,
   seedSearchStringFromSelection: 'always',
+  refactoringAutoSave: true,
 };
 
 export interface WorkspaceInfo {
@@ -78,9 +81,21 @@ export interface DiskRead {
 
 export type ContentChange = { range: L.Range; text: string } | { text: string };
 
+/** The parts of LSP `ServerCapabilities` the UI looks at. */
+export interface ServerCapabilities {
+  renameProvider?: boolean | { prepareProvider?: boolean };
+}
+
 export type ServerStatus =
   | { state: 'starting' }
-  | { state: 'ready'; name: string; languages: string[]; completionTriggerCharacters: string[] }
+  | {
+      state: 'ready';
+      name: string;
+      languages: string[];
+      completionTriggerCharacters: string[];
+      /** The server's LSP `ServerCapabilities`. */
+      capabilities: ServerCapabilities;
+    }
   | { state: 'notInstalled'; command: string }
   | { state: 'failed'; message: string }
   /** Exited on its own; `restarting` unless it crashed too often. */
@@ -97,7 +112,9 @@ export type LspEvent =
   | { kind: 'diagnostics'; server: string; uri: string; version: number | null; diagnostics: L.Diagnostic[] }
   | { kind: 'log'; server: string; level: string; message: string }
   | { kind: 'showMessage'; server: string; level: string; message: string }
-  | { kind: 'progress'; server: string; token: string | number; value: WorkDoneProgress };
+  | { kind: 'progress'; server: string; token: string | number; value: WorkDoneProgress }
+  /** A request from the server for the editor; answer with `backend.lspReply(id, …)`. */
+  | { kind: 'request'; server: string; id: number; method: string; params: unknown };
 
 /** A search as entered in the Search view (rc-core's `TextSearchQuery`). */
 export interface TextSearchQuery {
@@ -153,6 +170,9 @@ export const backend = {
   acceptDiskRead: (uri: string, readId: number) => invoke<void>('accept_disk_read', { uri, readId }),
   closeDocument: (uri: string) => invoke<void>('close_document', { uri }),
   lspRequest: <T>(uri: string, method: string, params: unknown) => invoke<T | null>('lsp_request', { uri, method, params }),
+  /** Answers a server request (`LspEvent` of kind `request`) with a result or an error message. */
+  lspReply: (id: number, answer: { result: unknown } | { error: string }) =>
+    invoke<void>('lsp_reply', { id, ...answer }),
   /** Restarts a server, named or as the server of a document; resolves to its name. */
   restartLanguageServer: (target: { server: string } | { uri: string }) =>
     invoke<string>('restart_language_server', target),

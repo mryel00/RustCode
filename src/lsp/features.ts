@@ -1,8 +1,15 @@
-// Wires language server results into Monaco: completion, hover, definition and
-// diagnostics, registered per server once it reports ready.
+// Wires language server results into Monaco: completion, hover, definition,
+// rename and diagnostics, registered per server once it reports ready.
 
 import type * as L from 'vscode-languageserver-types';
-import { backend, errorMessage, type LspEvent, type ServerStatus, type WorkDoneProgress } from '../backend';
+import {
+  backend,
+  errorMessage,
+  type LspEvent,
+  type ServerCapabilities,
+  type ServerStatus,
+  type WorkDoneProgress,
+} from '../backend';
 import { monaco, monacoLanguage } from '../monaco/setup';
 import { uriKey, type Doc, type Documents } from '../workbench/documents';
 import { Emitter } from '../workbench/events';
@@ -14,9 +21,11 @@ import {
   toLocationLinks,
   toLspPosition,
   toMarker,
+  toMonacoRange,
   type LspCompletionItem,
   type LspDefinition,
 } from './convert';
+import { isNoResultError, lspErrorMessage, textEditsOf, versionsMatch } from './workspace-edit';
 
 export interface ServerState {
   status: ServerStatus;
@@ -46,6 +55,8 @@ export class LanguageFeatures {
   readonly onDidChangeServers = new Emitter<void>();
   readonly onDidChangeProblems = new Emitter<ProblemCounts>();
   readonly onMessage = new Emitter<{ level: string; message: string }>();
+  /** A server asks the editor for something (`workspace/applyEdit`); it must be answered. */
+  readonly onServerRequest = new Emitter<{ server: string; id: number; method: string; params: unknown }>();
 
   private readonly registrations = new Map<string, monaco.IDisposable[]>();
   /** uriKey -> server -> diagnostics; kept for documents that are not open yet. */
@@ -89,13 +100,16 @@ export class LanguageFeatures {
       case 'log':
         if (event.level === 'error') console.warn(`[${event.server}]`, event.message);
         break;
+      case 'request':
+        this.onServerRequest.fire(event);
+        break;
     }
   }
 
   private handleStatus(server: string, status: ServerStatus): void {
     this.servers.set(server, { status });
     if (status.state === 'ready') {
-      this.register(server, status.languages, status.completionTriggerCharacters);
+      this.register(server, status.languages, status.completionTriggerCharacters, status.capabilities);
     } else {
       // Not running (also while restarting): like vscode-languageclient, drop
       // its providers, progress and diagnostics until it is ready again.
@@ -174,7 +188,12 @@ export class LanguageFeatures {
     this.onDidChangeProblems.fire(counts);
   }
 
-  private register(server: string, languages: string[], triggerCharacters: string[]): void {
+  private register(
+    server: string,
+    languages: string[],
+    triggerCharacters: string[],
+    capabilities: ServerCapabilities,
+  ): void {
     this.registrations.get(server)?.forEach((d) => d.dispose());
     const selector = [...new Set(languages.map(monacoLanguage))];
     const docs = this.docs;
@@ -239,6 +258,95 @@ export class LanguageFeatures {
         },
       }),
     ];
+    if (capabilities.renameProvider) {
+      const prepare = typeof capabilities.renameProvider === 'object' && capabilities.renameProvider.prepareProvider === true;
+      disposables.push(monaco.languages.registerRenameProvider(selector, this.renameProvider(prepare)));
+    }
     this.registrations.set(server, disposables);
   }
+
+  /**
+   * Rename, as vscode-languageclient's rename feature and VS Code's
+   * `RenameAdapter` do it: errors become reject reasons shown to the user,
+   * and `prepareRename` (when the server has it) decides what can be renamed.
+   */
+  private renameProvider(prepare: boolean): monaco.languages.RenameProvider {
+    const docs = this.docs;
+    const provider: monaco.languages.RenameProvider = {
+      async provideRenameEdits(model, position, newName, token) {
+        const doc = docs.getByModel(model);
+        if (!doc) return null;
+        let result: L.WorkspaceEdit | null;
+        try {
+          await doc.sync.idle();
+          result = await backend.lspRequest<L.WorkspaceEdit>(doc.uri, 'textDocument/rename', {
+            textDocument: { uri: doc.uri },
+            position: toLspPosition(position),
+            newName,
+          });
+        } catch (err) {
+          if (isNoResultError(err)) return null;
+          return { edits: [], rejectReason: lspErrorMessage(err) };
+        }
+        if (token.isCancellationRequested || !result) return null;
+        if (!versionsMatch(result, (uri) => docs.get(uri)?.version)) {
+          return {
+            edits: [],
+            rejectReason: 'The rename edit returned from the server is not valid anymore and cannot be applied.',
+          };
+        }
+        const converted = textEditsOf(result, uriKey);
+        if (!converted.ok) return { edits: [], rejectReason: converted.reason };
+        const edits: monaco.languages.IWorkspaceTextEdit[] = converted.files.flatMap((file) =>
+          file.edits.map((e) => ({
+            resource: monaco.Uri.parse(file.uri),
+            textEdit: { range: toMonacoRange(e.range), text: e.newText },
+            versionId: undefined,
+          })),
+        );
+        return { edits };
+      },
+    };
+    if (prepare) {
+      provider.resolveRenameLocation = async (model, position, token) => {
+        const doc = docs.getByModel(model);
+        if (!doc) return null;
+        type Prepared = L.Range | { range: L.Range; placeholder: string } | { defaultBehavior: boolean } | null;
+        let result: Prepared;
+        try {
+          await doc.sync.idle();
+          result = await backend.lspRequest<Prepared>(doc.uri, 'textDocument/prepareRename', {
+            textDocument: { uri: doc.uri },
+            position: toLspPosition(position),
+          });
+        } catch (err) {
+          return { range: emptyRange(position), text: '', rejectReason: lspErrorMessage(err) };
+        }
+        if (token.isCancellationRequested) return null;
+        const cannot = { range: emptyRange(position), text: '', rejectReason: "The element can't be renamed." };
+        let range: L.Range;
+        let text: string;
+        if (result && 'start' in result) {
+          range = result;
+          text = model.getValueInRange(toMonacoRange(result));
+        } else if (result && 'defaultBehavior' in result) {
+          // Rename the word at the cursor, as if there were no prepareRename.
+          return result.defaultBehavior ? null : cannot;
+        } else if (result && 'range' in result) {
+          range = result.range;
+          text = result.placeholder;
+        } else {
+          return cannot;
+        }
+        // VS Code ignores locations without text or not on the cursor's line.
+        if (!text || range.start.line > position.lineNumber - 1 || range.end.line < position.lineNumber - 1) return null;
+        return { range: toMonacoRange(range), text };
+      };
+    }
+    return provider;
+  }
+}
+
+function emptyRange(position: monaco.IPosition): monaco.IRange {
+  return { startLineNumber: position.lineNumber, startColumn: position.column, endLineNumber: position.lineNumber, endColumn: position.column };
 }

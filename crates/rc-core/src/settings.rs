@@ -93,6 +93,9 @@ pub struct Settings {
     pub watcher_exclude: ExcludeExpression,
     pub search: SearchSettings,
     pub seed_search_string_from_selection: SeedSearchString,
+    /// `files.refactoring.autoSave`: save the files a rename or code action
+    /// changed, when it changed more than one.
+    pub refactoring_auto_save: bool,
     /// Problems with the settings files: unreadable or invalid JSON (that
     /// file is ignored), values of the wrong type, patterns that are not
     /// valid globs (each left out).
@@ -107,6 +110,7 @@ impl Default for Settings {
             watcher_exclude: ExcludeExpression::enabled(DEFAULT_EXCLUDES.iter().copied()),
             search: SearchSettings::default(),
             seed_search_string_from_selection: SeedSearchString::Always,
+            refactoring_auto_save: true,
             warnings: Vec::new(),
         }
     }
@@ -122,6 +126,7 @@ pub struct UiSettings {
     pub search_on_type_debounce_period: u64,
     pub seed_with_nearest_word: bool,
     pub seed_search_string_from_selection: SeedSearchString,
+    pub refactoring_auto_save: bool,
 }
 
 impl Settings {
@@ -177,6 +182,7 @@ impl Settings {
         layer.bool("search.smartCase", &mut search.smart_case);
         layer.bool("search.searchOnType", &mut search.search_on_type);
         layer.bool("search.seedWithNearestWord", &mut search.seed_with_nearest_word);
+        layer.bool("files.refactoring.autoSave", &mut self.refactoring_auto_save);
         match layer.get("search.maxResults") {
             None => {}
             Some(Value::Null) => search.max_results = None,
@@ -226,6 +232,7 @@ impl Settings {
             search_on_type_debounce_period: self.search.search_on_type_debounce_period,
             seed_with_nearest_word: self.search.seed_with_nearest_word,
             seed_search_string_from_selection: self.seed_search_string_from_selection,
+            refactoring_auto_save: self.refactoring_auto_save,
         }
     }
 }
@@ -390,7 +397,8 @@ mod tests {
                 "search.smartCase": true, "search.maxResults": null, "search.searchOnType": false,
                 "search.searchOnTypeDebouncePeriod": 50, "search.seedWithNearestWord": true,
                 "editor.find": { "seedSearchStringFromSelection": "selection" },
-                "files.watcherExclude": { "**/target/**": true, ".git/objects/**": false }
+                "files.watcherExclude": { "**/target/**": true, ".git/objects/**": false },
+                "files": { "refactoring": { "autoSave": false } }
             }"#,
         )
         .unwrap();
@@ -409,6 +417,7 @@ mod tests {
             }
         );
         assert_eq!(settings.seed_search_string_from_selection, SeedSearchString::Selection);
+        assert!(!settings.ui().refactoring_auto_save && Settings::default().refactoring_auto_save);
         let watcher = settings.watcher_exclude.plain_patterns();
         assert!(watcher.contains(&"**/target/**".to_owned()) && !watcher.contains(&".git/objects/**".to_owned()));
         assert_eq!(

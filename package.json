@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "tauri": "tauri",
-    "test": "node --experimental-strip-types --no-warnings scripts/test-text-update.ts && node --experimental-strip-types --no-warnings scripts/test-search.ts"
+    "test": "node --experimental-strip-types --no-warnings scripts/test-text-update.ts && node --experimental-strip-types --no-warnings scripts/test-search.ts && node --experimental-strip-types --no-warnings scripts/test-workspace-edit.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

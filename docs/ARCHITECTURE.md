@@ -173,7 +173,49 @@ vscode-languageclient, a manual restart does not reset the crash count.
 
 Events (status, diagnostics, progress, messages) flow to the UI as one
 `lsp-event` stream. The UI registers Monaco providers per server once it is
-ready, using the server's own completion trigger characters.
+ready, from the capabilities it sent (its completion trigger characters,
+whether it renames and prepares renames).
+
+Requests only the editor can answer (`workspace/applyEdit`) reach the UI as
+`lsp-event`s of kind `request` with an id of the manager's; the UI answers with
+`lsp_reply`. The answer goes through the server's ordered channel, so the
+server receives the edits the request caused before the answer. Requests of a
+process that has exited or been restarted can no longer be answered.
+
+## Workspace edits and rename
+
+Rename (F2, Monaco's rename widget) works like vscode-languageclient's rename
+feature and VS Code's `RenameAdapter`: `textDocument/prepareRename` (when the
+server supports it) decides what is renamed and with which placeholder, a
+`defaultBehavior` answer falls back to the word at the cursor, and server
+errors are shown as the reason the rename was rejected. A rename result for
+an open document whose version changed meanwhile is rejected.
+
+Monaco's features apply workspace edits through VS Code's `IBulkEditService`.
+RustCode replaces Monaco's own (which only edits loaded models and never saves)
+with `src/lsp/bulk-edit.ts`, a port of VS Code's `BulkEditService` and
+`BulkTextEdits`; Monaco's notifications (e.g. "Rename failed to apply edits")
+become toasts. Server `workspace/applyEdit` requests use the same code, with
+vscode-languageclient's checks: edits are applied one request at a time, and
+not at all when a versioned edit targets an open document whose version
+changed.
+
+- Edits of one file apply together, against the file as it is (several
+  `TextDocumentEdit`s for one file are merged, as in VS Code); `documentChanges`
+  win over `changes`. No-op edits are dropped; overlapping edits fail the whole
+  edit before anything changes.
+- Files that are not open are opened for the edit. Those that changed stay open
+  in the background with unsaved changes (shown when opened, asked about when
+  closing the window); the others are closed again.
+- Edits in the active editor go through the editor and are first made minimal
+  with Monaco's editor worker (`computeMoreMinimalEdits`), so cursors stay put.
+  Each file's edits are one undo step.
+- `files.refactoring.autoSave` (default on): a rename, or a
+  `workspace/applyEdit` marked `isRefactoring`, that changed more than one file
+  saves the changed files.
+- The client announces `documentChanges`, text-only transactional failure
+  handling and line ending normalization, but no resource operations (create,
+  rename, delete files), change annotations or snippet edits.
 
 ## Settings
 
@@ -193,6 +235,7 @@ Settings read, all with VS Code's defaults:
 |---|---|
 | `files.exclude`, `search.exclude` | explorer, search |
 | `files.watcherExclude` | file watcher |
+| `files.refactoring.autoSave` | workspace edits |
 | `search.useIgnoreFiles`, `search.useParentIgnoreFiles`, `search.useGlobalIgnoreFiles`, `search.followSymlinks` | search walk |
 | `search.maxResults` (`null`: no limit) | search, backend and open documents |
 | `search.smartCase`, `search.searchOnType`, `search.searchOnTypeDebouncePeriod`, `search.seedWithNearestWord`, `editor.find.seedSearchStringFromSelection` | Search view |
@@ -251,7 +294,11 @@ Extensions are planned, not built. The design keeps that door open:
 
 ## Known limitations
 
-- No terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
+- No terminal, settings UI or multiple editor groups.
+- Workspace edits: no resource operations (creating, renaming, deleting files),
+  change annotations, snippet edits, rename preview or workspace-wide undo
+  (each file undoes on its own). Code actions and formatting are not wired to
+  the language servers yet.
 - Settings: only the settings in the table above, from the default VS Code
   profile (no other profiles, `.code-workspace` files or language-specific
   `[lang]` blocks). The explorer does not show excluded files that are open in

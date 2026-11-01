@@ -1,5 +1,5 @@
-//! Restarting crashed servers, against a small fake server written in Python.
-//! Skipped if `python3` is not on PATH.
+//! Restarting crashed servers and answering server requests, against a small
+//! fake server written in Python. Skipped if `python3` is not on PATH.
 
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use rc_lsp::{LspError, LspManager, ManagerEvent, ServerConfig, ServerStatus};
@@ -47,6 +47,22 @@ impl Fixture {
                 Ok(Some(ManagerEvent::Status { status, .. })) => return status,
                 Ok(Some(_)) => {}
                 _ => panic!("no status event"),
+            }
+        }
+    }
+
+    /// Waits for the next server request; returns its id and params.
+    async fn server_request(&mut self) -> (u64, String, Value) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, self.rx.recv()).await {
+                Ok(Some(ManagerEvent::Request { server, id, method, params })) => {
+                    assert_eq!(server, "fake");
+                    return (id, method, params);
+                }
+                Ok(Some(_)) => {}
+                _ => panic!("no server request"),
             }
         }
     }
@@ -163,4 +179,47 @@ async fn shutdown_does_not_wait_for_a_starting_server() {
     let started = Instant::now();
     f.mgr.shutdown().await;
     assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn apply_edit_requests_are_answered_after_the_edits_they_caused() {
+    let Some(mut f) = fixture(&[]) else { return };
+    f.mgr.open(f.uri.clone(), "fake", 0, "old".into());
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(matches!(f.status().await, ServerStatus::Ready { .. }));
+    let state = f.state().await;
+    assert_eq!(state["capabilities"]["workspace"]["applyEdit"], json!(true));
+    assert_eq!(state["capabilities"]["workspace"]["workspaceEdit"]["documentChanges"], json!(true));
+
+    let edit = json!({"label": "x", "edit": {"changes": {f.uri.as_str(): [
+        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}}, "newText": "new"}
+    ]}}});
+    f.mgr.request(&f.uri, "fake/applyEdit", edit.clone()).await.unwrap();
+    let (id, method, params) = f.server_request().await;
+    assert_eq!(method, "workspace/applyEdit");
+    assert_eq!(params, edit);
+
+    // The editor applies the edit, then answers: the server sees the change first.
+    f.mgr.change(&f.uri, 1, vec![replace_all("new")]);
+    assert!(f.mgr.reply(id, Ok(json!({"applied": true}))));
+    assert!(!f.mgr.reply(id, Ok(json!({"applied": true}))), "answered once");
+    let replies = f.state().await["replies"].clone();
+    assert_eq!(replies, json!([{"id": "edit-0", "result": {"applied": true}, "error": null, "versions": {f.uri.as_str(): 1}}]));
+
+    // Errors are answered as JSON-RPC errors.
+    f.mgr.request(&f.uri, "fake/applyEdit", edit.clone()).await.unwrap();
+    let (id, _, _) = f.server_request().await;
+    assert!(f.mgr.reply(id, Err("no".into())));
+    let replies = f.state().await["replies"].clone();
+    assert_eq!(replies[1]["error"], json!({"code": -32603, "message": "no"}));
+
+    // A request of a process that has gone away cannot be answered.
+    f.mgr.request(&f.uri, "fake/applyEdit", edit).await.unwrap();
+    let (id, _, _) = f.server_request().await;
+    assert!(f.mgr.restart("fake"));
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(matches!(f.status().await, ServerStatus::Ready { .. }));
+    assert!(!f.mgr.reply(id, Ok(json!({"applied": false}))));
+    assert_eq!(f.state().await["replies"], json!([]), "a new process");
+    f.mgr.shutdown().await;
 }
