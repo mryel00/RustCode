@@ -1,0 +1,22 @@
+[package]
+name = "rc-lsp"
+description = "RustCode Language Server Protocol client and server manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rc-core.workspace = true
+ropey.workspace = true
+lsp-types.workspace = true
+url.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+log.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

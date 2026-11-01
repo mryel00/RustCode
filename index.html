@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RustCode</title>
+  </head>
+  <body>
+    <div id="workbench">
+      <aside id="sidebar">
+        <header class="sidebar-title">
+          <span>Explorer</span>
+          <span class="sidebar-actions">
+            <button id="refresh-explorer" class="icon-button codicon codicon-refresh" title="Refresh Explorer"></button>
+            <button id="open-folder" class="icon-button codicon codicon-folder-opened" title="Open Folder (Ctrl+O)"></button>
+          </span>
+        </header>
+        <div id="workspace-name" class="workspace-name"></div>
+        <div id="explorer" class="explorer" role="tree"></div>
+      </aside>
+      <div id="sash" class="sash" role="separator" aria-orientation="vertical"></div>
+      <main id="main">
+        <div id="tabs" class="tabs" role="tablist"></div>
+        <div id="editor-host">
+          <div id="editor"></div>
+          <div id="welcome" class="welcome">
+            <h1>RustCode</h1>
+            <p>Editing evolved, in Rust.</p>
+            <button id="welcome-open" class="primary-button">Open Folder…</button>
+            <ul class="shortcuts">
+              <li><kbd>Ctrl</kbd>+<kbd>O</kbd> Open Folder</li>
+              <li><kbd>Ctrl</kbd>+<kbd>S</kbd> Save</li>
+              <li><kbd>Ctrl</kbd>+<kbd>W</kbd> Close Editor</li>
+              <li><kbd>F12</kbd> Go to Definition</li>
+              <li><kbd>Ctrl</kbd>+<kbd>Space</kbd> Trigger Suggest</li>
+            </ul>
+          </div>
+        </div>
+      </main>
+    </div>
+    <footer id="statusbar" class="statusbar">
+      <div class="status-left">
+        <span id="status-problems" class="status-item" title="Problems"></span>
+        <span id="status-servers" class="status-item"></span>
+      </div>
+      <div class="status-right">
+        <span id="status-cursor" class="status-item"></span>
+        <span id="status-eol" class="status-item"></span>
+        <span id="status-language" class="status-item"></span>
+      </div>
+    </footer>
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

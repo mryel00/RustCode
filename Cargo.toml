@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/rc-core", "crates/rc-lsp", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+rc-core = { path = "crates/rc-core" }
+rc-lsp = { path = "crates/rc-lsp" }
+
+# unicode_lines is disabled on purpose: LSP and Monaco only treat \n, \r\n and \r
+# as line breaks, so the rope must do the same or line numbers drift apart.
+ropey = { version = "1.6", default-features = false, features = ["cr_lines", "simd"] }
+lsp-types = "0.95"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+log = "0.4"
+dunce = "1"
+which = "8"
+tempfile = "3"

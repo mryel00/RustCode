@@ -1,0 +1,18 @@
+[package]
+name = "rc-core"
+description = "RustCode core: workspace file system, documents and text model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ropey.workspace = true
+lsp-types.workspace = true
+url.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+dunce.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
