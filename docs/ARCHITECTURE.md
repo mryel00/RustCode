@@ -151,6 +151,18 @@ registration, keeping file watcher registrations), cancels timed-out requests wi
 servers down with `shutdown`/`exit` (killing them if they hang). Servers also
 exit on their own when the app dies, because their stdin closes.
 
+A server that exits on its own is restarted like vscode-languageclient's
+`DefaultErrorHandler`: after every close, unless it is the fifth close within
+three minutes; then it stays stopped and the UI shows "The … server crashed 5
+times in the last 3 minutes. The server will not be restarted." The server task
+keeps its mirrors across the restart, so the new process gets `didOpen` for
+every open document at its current version, then whatever was queued while it
+started (edits, requests). Requests in flight when it crashed fail; the UI drops
+the server's diagnostics and providers and registers them again once it is
+ready. A server that fails during `initialize` is not restarted (VS Code stops
+it too), and shutting down while a server is still starting kills it instead
+of waiting for the handshake.
+
 Events (status, diagnostics, progress, messages) flow to the UI as one
 `lsp-event` stream. The UI registers Monaco providers per server once it is
 ready, using the server's own completion trigger characters.
@@ -231,7 +243,8 @@ Extensions are planned, not built. The design keeps that door open:
 
 ## Known limitations
 
-- A crashed language server is not restarted automatically (reopen the folder).
+- A language server that crashed too often stays stopped until the folder is
+  reopened (VS Code extensions usually add their own "Restart Server" command).
 - No terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
 - Settings: only the settings in the table above, from the default VS Code
   profile (no other profiles, `.code-workspace` files or language-specific

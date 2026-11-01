@@ -83,7 +83,8 @@ export type ServerStatus =
   | { state: 'ready'; name: string; languages: string[]; completionTriggerCharacters: string[] }
   | { state: 'notInstalled'; command: string }
   | { state: 'failed'; message: string }
-  | { state: 'exited'; code: number | null };
+  /** Exited on its own; `restarting` unless it crashed too often. */
+  | { state: 'exited'; code: number | null; restarting: boolean; message: string };
 
 /** `$/progress` payloads (LSP work done progress). */
 export type WorkDoneProgress =

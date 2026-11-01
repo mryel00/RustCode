@@ -5,6 +5,9 @@
 //! close and requests) goes through one ordered queue, so a completion request
 //! is never sent before the edit that preceded it, even while the server is
 //! still starting.
+//!
+//! A server that exits on its own is restarted like vscode-languageclient does
+//! (up to five closes in three minutes) and gets every open document again.
 
 use crate::{
     client::{Incoming, LspClient, LspError},
@@ -24,10 +27,10 @@ use ropey::Rope;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
@@ -41,7 +44,9 @@ pub enum ServerStatus {
     Ready { name: String, languages: Vec<String>, completion_trigger_characters: Vec<String> },
     NotInstalled { command: String },
     Failed { message: String },
-    Exited { code: Option<i32> },
+    /// The server went away on its own. `restarting`: a new process is being
+    /// started; otherwise it crashed too often and stays stopped.
+    Exited { code: Option<i32>, restarting: bool, message: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,24 +189,122 @@ async fn run_server(
     let status = |status: ServerStatus| {
         let _ = events.send(ManagerEvent::Status { server: id.clone(), status });
     };
-    status(ServerStatus::Starting);
+    // Survive restarts: the documents the server should have open, and the
+    // commands that arrived while it was starting.
+    let mut mirrors: HashMap<Url, Mirror> = HashMap::new();
+    let mut queued: VecDeque<Cmd> = VecDeque::new();
+    let mut restarts = RestartPolicy::default();
+    loop {
+        status(ServerStatus::Starting);
+        let (client, mut incoming, caps) = match start(&config, &root, &root_path, &mut rx, &mut queued, &events).await {
+            Started::Ready(client, incoming, caps) => (client, incoming, caps),
+            Started::Failed(failure, reason) => {
+                status(failure);
+                return reject_all(queued, rx, reason).await;
+            }
+            Started::ShutDown => return,
+        };
+        status(ServerStatus::Ready {
+            name: config.id.clone(),
+            languages: config.languages.clone(),
+            completion_trigger_characters: caps
+                .completion_provider
+                .as_ref()
+                .and_then(|c| c.trigger_characters.clone())
+                .unwrap_or_default(),
+        });
 
-    let Ok(program) = which::which(&config.command) else {
-        status(ServerStatus::NotInstalled { command: config.command.clone() });
-        return reject_all(rx, format!("{} is not installed", config.command)).await;
-    };
-    let (client, mut incoming) = match LspClient::spawn(&program, &config.args, &root, &root_path) {
-        Ok(spawned) => spawned,
-        Err(e) => {
-            status(ServerStatus::Failed { message: e.to_string() });
-            return reject_all(rx, e.to_string()).await;
+        let sync = SyncInfo::from(&*caps);
+        // After a restart, the new process gets every document the old one had,
+        // at its current version, before anything that was queued meanwhile.
+        if sync.open_close {
+            for (uri, doc) in &mirrors {
+                let item = TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: doc.language_id.clone(),
+                    version: doc.version,
+                    text: doc.text.to_string(),
+                };
+                let _ = client.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams { text_document: item });
+            }
         }
+        while let Some(cmd) = queued.pop_front() {
+            handle(cmd, &client, &caps, &sync, &mut mirrors);
+        }
+
+        let code = loop {
+            tokio::select! {
+                cmd = rx.recv() => {
+                    match cmd {
+                        Some(Cmd::Shutdown { done }) => {
+                            client.shutdown().await;
+                            let _ = done.send(());
+                            return;
+                        }
+                        Some(cmd) => handle(cmd, &client, &caps, &sync, &mut mirrors),
+                        None => {
+                            client.shutdown().await;
+                            return;
+                        }
+                    }
+                }
+                event = incoming.recv() => match event {
+                    Some(Incoming::Exited(code)) => break code,
+                    None => break None,
+                    Some(event) => forward(&id, event, &events),
+                }
+            }
+        };
+
+        // The server went away without being asked to: restart it unless it
+        // keeps crashing (vscode-languageclient's DefaultErrorHandler.closed).
+        if restarts.closed(Instant::now()) {
+            let message = "Connection to server got closed. Server will restart.".to_owned();
+            let _ = events.send(ManagerEvent::Log { server: id.clone(), level: "info", message: message.clone() });
+            status(ServerStatus::Exited { code, restarting: true, message });
+        } else {
+            let message = format!(
+                "The {id} server crashed {} times in the last 3 minutes. The server will not be restarted.",
+                MAX_RESTART_COUNT + 1
+            );
+            let _ = events.send(ManagerEvent::Log { server: id.clone(), level: "error", message: message.clone() });
+            status(ServerStatus::Exited { code, restarting: false, message: message.clone() });
+            return reject_all(VecDeque::new(), rx, message).await;
+        }
+    }
+}
+
+enum Started {
+    Ready(LspClient, mpsc::UnboundedReceiver<Incoming>, Box<ServerCapabilities>),
+    /// The status to report and the reason to give requests.
+    Failed(ServerStatus, String),
+    /// Shut down (or the manager went away) before the server was ready.
+    ShutDown,
+}
+
+/// Spawns the server and runs the `initialize` handshake. Commands arriving
+/// meanwhile are queued, except a shutdown, which ends the start.
+async fn start(
+    config: &ServerConfig,
+    root: &Url,
+    root_path: &Path,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    queued: &mut VecDeque<Cmd>,
+    events: &mpsc::UnboundedSender<ManagerEvent>,
+) -> Started {
+    let Ok(program) = which::which(&config.command) else {
+        let reason = format!("{} is not installed", config.command);
+        return Started::Failed(ServerStatus::NotInstalled { command: config.command.clone() }, reason);
+    };
+    let (client, mut incoming) = match LspClient::spawn(&program, &config.args, root, root_path) {
+        Ok(spawned) => spawned,
+        Err(e) => return Started::Failed(ServerStatus::Failed { message: e.to_string() }, e.to_string()),
     };
     // Keep reading server output during the handshake so stderr cannot fill up,
     // and remember the first stderr line to explain a failed start.
     let mut first_stderr: Option<String> = None;
     let init = {
-        let handshake = client.initialize(&root);
+        let handshake = client.initialize(root);
         tokio::pin!(handshake);
         loop {
             tokio::select! {
@@ -213,67 +316,75 @@ async fn run_server(
                     {
                         first_stderr = Some(line.trim().to_owned());
                     }
-                    forward(&id, event, &events);
+                    forward(&config.id, event, events);
                 }
+                cmd = rx.recv() => match cmd {
+                    Some(Cmd::Shutdown { done }) => {
+                        client.kill().await;
+                        let _ = done.send(());
+                        return Started::ShutDown;
+                    }
+                    Some(cmd) => queued.push_back(cmd),
+                    None => {
+                        client.kill().await;
+                        return Started::ShutDown;
+                    }
+                },
             }
         }
     };
-    let caps = match init {
-        Ok(result) => result.capabilities,
+    match init {
+        Ok(result) => Started::Ready(client, incoming, Box::new(result.capabilities)),
         Err(e) => {
             let message = match first_stderr {
                 Some(line) => format!("{e}: {line}"),
                 None => e.to_string(),
             };
-            status(ServerStatus::Failed { message });
             client.shutdown().await;
-            return reject_all(rx, e.to_string()).await;
-        }
-    };
-    status(ServerStatus::Ready {
-        name: config.id.clone(),
-        languages: config.languages.clone(),
-        completion_trigger_characters: caps
-            .completion_provider
-            .as_ref()
-            .and_then(|c| c.trigger_characters.clone())
-            .unwrap_or_default(),
-    });
-
-    let sync = SyncInfo::from(&caps);
-    let mut mirrors: HashMap<Url, Rope> = HashMap::new();
-    loop {
-        tokio::select! {
-            cmd = rx.recv() => {
-                let Some(cmd) = cmd else { break };
-                if let Cmd::Shutdown { done } = cmd {
-                    client.shutdown().await;
-                    let _ = done.send(());
-                    return;
-                }
-                handle(cmd, &client, &caps, &sync, &mut mirrors);
-            }
-            event = incoming.recv() => {
-                let code = match event {
-                    Some(Incoming::Exited(code)) => code,
-                    None => None,
-                    Some(event) => {
-                        forward(&id, event, &events);
-                        continue;
-                    }
-                };
-                status(ServerStatus::Exited { code });
-                return reject_all(rx, format!("{id} exited")).await;
-            }
+            Started::Failed(ServerStatus::Failed { message }, e.to_string())
         }
     }
-    client.shutdown().await;
 }
 
-fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncInfo, mirrors: &mut HashMap<Url, Rope>) {
+/// Restarts allowed in a row before the time window is checked.
+const MAX_RESTART_COUNT: usize = 4;
+const RESTART_WINDOW: Duration = Duration::from_secs(3 * 60);
+
+/// vscode-languageclient's default: restart after every close, unless the
+/// server closed `MAX_RESTART_COUNT + 1` times within three minutes.
+#[derive(Default)]
+struct RestartPolicy {
+    closes: VecDeque<Instant>,
+}
+
+impl RestartPolicy {
+    /// Records a close and says whether to restart.
+    fn closed(&mut self, now: Instant) -> bool {
+        self.closes.push_back(now);
+        if self.closes.len() <= MAX_RESTART_COUNT {
+            return true;
+        }
+        let first = self.closes[0];
+        if now.duration_since(first) <= RESTART_WINDOW {
+            return false;
+        }
+        self.closes.pop_front();
+        true
+    }
+}
+
+/// A document as the server knows it.
+struct Mirror {
+    language_id: String,
+    version: i32,
+    text: Rope,
+}
+
+fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncInfo, mirrors: &mut HashMap<Url, Mirror>) {
     match cmd {
         Cmd::Open { uri, language_id, version, text } => {
-            mirrors.insert(uri.clone(), Rope::from_str(&text));
+            let mirror = Mirror { language_id: language_id.clone(), version, text: Rope::from_str(&text) };
+            mirrors.insert(uri.clone(), mirror);
             if sync.open_close {
                 let item = TextDocumentItem { uri, language_id, version, text };
                 let _ = client.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams { text_document: item });
@@ -281,11 +392,12 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
         }
         Cmd::Change { uri, version, changes } => {
             let Some(mirror) = mirrors.get_mut(&uri) else { return };
-            rc_core::text::apply_changes(mirror, &changes);
+            rc_core::text::apply_changes(&mut mirror.text, &changes);
+            mirror.version = version;
             let content_changes = if sync.change == TextDocumentSyncKind::INCREMENTAL {
                 changes
             } else if sync.change == TextDocumentSyncKind::FULL {
-                vec![TextDocumentContentChangeEvent { range: None, range_length: None, text: mirror.to_string() }]
+                vec![TextDocumentContentChangeEvent { range: None, range_length: None, text: mirror.text.to_string() }]
             } else {
                 return;
             };
@@ -296,7 +408,7 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
         }
         Cmd::Save { uri } => {
             let Some(include_text) = sync.save else { return };
-            let text = include_text.then(|| mirrors.get(&uri).map(Rope::to_string)).flatten();
+            let text = include_text.then(|| mirrors.get(&uri).map(|m| m.text.to_string())).flatten();
             let _ = client.notify::<DidSaveTextDocument>(DidSaveTextDocumentParams {
                 text_document: TextDocumentIdentifier { uri },
                 text,
@@ -338,9 +450,15 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
     }
 }
 
-/// After a server failed to start or exited: answer requests with an error and
-/// drop everything else, until the manager shuts down.
-async fn reject_all(mut rx: mpsc::UnboundedReceiver<Cmd>, reason: String) {
+/// After a server failed to start or stopped for good: answer requests (queued
+/// ones first) with an error and drop everything else, until the manager shuts
+/// down.
+async fn reject_all(queued: VecDeque<Cmd>, mut rx: mpsc::UnboundedReceiver<Cmd>, reason: String) {
+    for cmd in queued {
+        if let Cmd::Request { reply, .. } = cmd {
+            let _ = reply.send(Err(LspError::Unavailable(reason.clone())));
+        }
+    }
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Cmd::Request { reply, .. } => {
@@ -433,5 +551,34 @@ fn supports(caps: &ServerCapabilities, method: &str) -> bool {
         "textDocument/definition" => !matches!(caps.definition_provider, None | Some(OneOf::Left(false))),
         "textDocument/signatureHelp" => caps.signature_help_provider.is_some(),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_policy_matches_vscode_languageclient() {
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut policy = RestartPolicy::default();
+        // Four closes always restart.
+        for s in 0..4 {
+            assert!(policy.closed(at(s)));
+        }
+        // The fifth within three minutes of the first does not.
+        assert!(!policy.closed(at(180)));
+
+        let mut policy = RestartPolicy::default();
+        for s in 0..4 {
+            assert!(policy.closed(at(s)));
+        }
+        // Spread over more than three minutes: keep restarting, sliding the window.
+        for s in [181, 182, 200, 201] {
+            assert!(policy.closed(at(s)));
+        }
+        // Now 181, 182, 200, 201 and 202 fall within three minutes.
+        assert!(!policy.closed(at(202)));
     }
 }

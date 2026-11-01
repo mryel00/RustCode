@@ -100,8 +100,11 @@ export class LanguageFeatures {
       this.registrations.get(server)?.forEach((d) => d.dispose());
       this.registrations.delete(server);
       this.progress.delete(server);
+      // Like vscode-languageclient, a stopped or restarting server's diagnostics go away.
+      this.clearDiagnostics(server);
       if (status.state === 'failed') this.onMessage.fire({ level: 'error', message: `${server} failed to start: ${status.message}` });
-      if (status.state === 'exited') this.onMessage.fire({ level: 'warning', message: `${server} stopped (exit code ${status.code ?? 'unknown'})` });
+      // A restart is only logged; giving up is shown (DefaultErrorHandler).
+      if (status.state === 'exited' && !status.restarting) this.onMessage.fire({ level: 'error', message: status.message });
     }
     this.onDidChangeServers.fire();
   }
@@ -136,6 +139,17 @@ export class LanguageFeatures {
     const doc = this.docs.get(uri);
     if (doc) this.applyMarkers(doc);
     this.fireProblems();
+  }
+
+  private clearDiagnostics(server: string): void {
+    let changed = false;
+    for (const [key, byServer] of this.diagnostics) {
+      if (!byServer.delete(server)) continue;
+      changed = true;
+      if (byServer.size === 0) this.diagnostics.delete(key);
+    }
+    for (const model of monaco.editor.getModels()) monaco.editor.setModelMarkers(model, `lsp:${server}`, []);
+    if (changed) this.fireProblems();
   }
 
   private applyMarkers(doc: Doc): void {

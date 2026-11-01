@@ -60,8 +60,8 @@ export class StatusBar {
           title = status.message;
           break;
         case 'exited':
-          icon = 'codicon-debug-stop';
-          title = `${name} exited (code ${status.code ?? 'unknown'})`;
+          icon = status.restarting ? 'codicon-loading codicon-modifier-spin' : 'codicon-debug-stop';
+          title = `${name} exited (code ${status.code ?? 'unknown'}). ${status.message}`;
           break;
       }
       el.title = title;

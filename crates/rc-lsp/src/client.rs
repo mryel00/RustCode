@@ -237,9 +237,17 @@ impl LspClient {
             let mut exited = self.inner.exited.clone();
             let _ = tokio::time::timeout(Duration::from_secs(2), exited.wait_for(|e| *e)).await;
         }
+        self.kill().await;
+    }
+
+    /// Kills the process without the `shutdown` handshake (for a server that has
+    /// not finished initializing) and waits until it is gone.
+    pub async fn kill(&self) {
         if let Some(kill) = self.inner.kill.lock().unwrap().take() {
             let _ = kill.send(());
         }
+        let mut exited = self.inner.exited.clone();
+        let _ = tokio::time::timeout(Duration::from_secs(2), exited.wait_for(|e| *e)).await;
     }
 }
 
