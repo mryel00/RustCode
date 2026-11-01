@@ -1,10 +1,10 @@
 import './styles.css';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { ask, open as openDialog } from '@tauri-apps/plugin-dialog';
+import { ask, message, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { backend, errorMessage } from './backend';
 import { LanguageFeatures } from './lsp/features';
 import { monaco } from './monaco/setup';
-import { Documents } from './workbench/documents';
+import { Documents, type Doc } from './workbench/documents';
 import { EditorGroup } from './workbench/editor-group';
 import { Explorer } from './workbench/explorer';
 import { initSash } from './workbench/sash';
@@ -27,10 +27,26 @@ features.onMessage.on(({ level, message }) =>
   toast(message, level === 'error' ? 'error' : level === 'warning' ? 'warning' : 'info'),
 );
 void backend.onLspEvent((event) => features.handle(event));
+void backend.onFsEvent((event) => {
+  switch (event.kind) {
+    case 'changes':
+      docs.handleDiskChanges(event.documents);
+      void explorer.applyChanges(event.changes);
+      break;
+    case 'rescan':
+      docs.handleDiskChanges(event.documents);
+      void explorer.refresh();
+      break;
+    case 'error':
+      toast(`File changes may not be picked up: ${event.message}`, 'warning');
+      break;
+  }
+});
 
 function updateTitle(): void {
   const doc = group.activeDoc;
-  const parts = [doc ? `${docs.isDirty(doc) ? '● ' : ''}${doc.name}` : null, workspaceName, 'RustCode'];
+  const name = doc ? `${docs.isDirty(doc) ? '● ' : ''}${doc.name}${doc.orphaned ? ' (deleted)' : ''}` : null;
+  const parts = [name, workspaceName, 'RustCode'];
   void appWindow.setTitle(parts.filter(Boolean).join(' — '));
 }
 
@@ -41,6 +57,9 @@ group.onDidChangeActive.on((doc) => {
 });
 group.editor.onDidChangeCursorPosition(() => statusBar.setDocument(group.activeDoc, group.editor));
 docs.onDidChangeDirty.on((doc) => {
+  if (doc === group.activeDoc) updateTitle();
+});
+docs.onDidChangeOrphaned.on((doc) => {
   if (doc === group.activeDoc) updateTitle();
 });
 
@@ -69,11 +88,27 @@ async function pickFolder(): Promise<void> {
   if (typeof selected === 'string') await openWorkspace(selected);
 }
 
-async function saveActive(): Promise<void> {
+/** Saves a document; if the file changed on disk meanwhile, asks how to resolve it. */
+async function save(doc: Doc): Promise<void> {
+  try {
+    if ((await docs.save(doc)) === 'saved') return;
+    const choice = await message(
+      `Failed to save '${doc.name}': the content of the file is newer. ` +
+        'Overwrite the file with your changes, or revert to the file contents and discard your changes?',
+      { title: 'File changed on disk', kind: 'warning', buttons: { yes: 'Overwrite', no: 'Revert', cancel: 'Cancel' } },
+    );
+    if (choice === 'Overwrite') await docs.save(doc, true);
+    else if (choice === 'Revert') await docs.revert(doc);
+  } catch (err) {
+    report(err);
+  }
+}
+
+async function revertActive(): Promise<void> {
   const doc = group.activeDoc;
   if (!doc) return;
   try {
-    await docs.save(doc);
+    await docs.revert(doc);
   } catch (err) {
     report(err);
   }
@@ -89,7 +124,7 @@ window.addEventListener(
     if (key === 's' && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
-      void saveActive();
+      if (group.activeDoc) void save(group.activeDoc);
     } else if (key === 'o' && !e.shiftKey) {
       e.preventDefault();
       e.stopPropagation();
@@ -127,4 +162,4 @@ void backend.initialPath().then((path) => {
 });
 
 // Exposed for debugging from the devtools console.
-Object.assign(window, { rustcode: { monaco, docs, group, features } });
+Object.assign(window, { rustcode: { monaco, docs, group, features, explorer, revertActive } });

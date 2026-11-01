@@ -41,6 +41,41 @@ corrupted.
    request is never sent before the edit that preceded it. On a failed sync
    the UI resends the full text.
 
+## File watching
+
+Opening a folder starts a recursive watcher (`rc-core::watcher`, built on
+`notify`) in the background. Like VS Code it collects raw events for 75 ms,
+coalesces them (created+deleted cancel out, deleted+created becomes changed,
+deletes inside a deleted folder are dropped) and skips VS Code's default
+`files.watcherExclude` (`.git/objects`, `.git/subtree-cache`, `.hg/store`).
+Each batch goes to three places:
+
+- **Language servers** get `workspace/didChangeWatchedFiles`, filtered by the
+  glob watchers each server registered through `client/registerCapability`
+  (`rc-lsp::watched_files`), as vscode-languageclient does.
+- **Open documents**: every document records the disk content it was last
+  loaded from or saved to (`DiskStamp`: size and mtime as a quick check, a
+  content hash to decide). Affected documents are compared with the disk, so
+  our own saves and `touch` are not changes. The UI receives
+  `{ uri, exists, contentChanged }` per document in the `fs-event` stream.
+- **The explorer** relists the loaded folders that gained or lost entries.
+
+What the UI does with document changes follows VS Code:
+
+- no unsaved changes: the document reloads from disk with one minimal edit
+  (common leading/trailing lines kept, a port of `ModelService.updateModel`),
+  so cursor, scroll position and undo history survive. Reloads go through
+  the normal edit path: `read_document_from_disk`, edits through the sync
+  queue, then `accept_disk_read` marks the buffer as synced with the disk.
+- unsaved changes: nothing happens until save. `save_document` then answers
+  `conflict` without writing, and the UI offers Overwrite or Revert.
+- file deleted: the document stays open, its tab is struck through and marked
+  "(deleted)"; saving recreates the file.
+
+A lost-events signal (kernel queue overflow) triggers a full explorer refresh
+and a check of every open document. If the watch cannot be set up (for
+example the inotify limit), the UI shows a warning.
+
 ## Language servers
 
 `LspManager` maps language ids to `ServerConfig`s (`rc-lsp::config`) and starts
@@ -58,7 +93,7 @@ guarantees:
 
 The client negotiates UTF-16 positions, answers common server-to-client
 requests (`workspace/configuration`, progress creation, capability
-registration), cancels timed-out requests with `$/cancelRequest`, and shuts
+registration, keeping file watcher registrations), cancels timed-out requests with `$/cancelRequest`, and shuts
 servers down with `shutdown`/`exit` (killing them if they hang). Servers also
 exit on their own when the app dies, because their stdin closes.
 
@@ -87,9 +122,9 @@ Extensions are planned, not built. The design keeps that door open:
 - Language features are already provider-based on the UI side, so
   extension-contributed providers can be merged with LSP ones.
 
-## Known limitations (milestone 1)
+## Known limitations
 
-- No file watching: external changes are not picked up until reopen;
-  use the explorer's refresh button for new files.
 - A crashed language server is not restarted automatically (reopen the folder).
 - No search, terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
+- `files.watcherExclude` is fixed to VS Code's defaults (no settings yet), and
+  there is no diff view for save conflicts (VS Code's "Compare").

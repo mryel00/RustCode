@@ -1,10 +1,13 @@
 //! A JSON-RPC client for one language server process over stdio.
 
-use crate::transport::{encode_message, read_message};
+use crate::{
+    transport::{encode_message, read_message},
+    watched_files::{self, WatchedFiles},
+};
 use lsp_types::{
     notification::Notification, request::Request, ClientCapabilities, ClientInfo,
     CompletionClientCapabilities, CompletionItemCapability, CompletionItemCapabilityResolveSupport,
-    DiagnosticTag, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
+    DiagnosticTag, DidChangeWatchedFilesClientCapabilities, FileEvent, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities,
     InitializeParams, InitializeResult, MarkupKind, PositionEncodingKind,
     PublishDiagnosticsClientCapabilities, SignatureHelpClientCapabilities,
     TagSupport, TextDocumentClientCapabilities, TextDocumentSyncClientCapabilities,
@@ -73,6 +76,9 @@ struct Inner {
     workspace_folders: Vec<WorkspaceFolder>,
     exited: watch::Receiver<bool>,
     kill: Mutex<Option<oneshot::Sender<()>>>,
+    watched_files: Mutex<WatchedFiles>,
+    /// Reports problems that are not tied to a request (bad registrations).
+    events: mpsc::UnboundedSender<Incoming>,
 }
 
 /// Cheap to clone; all clones talk to the same process.
@@ -116,6 +122,8 @@ impl LspClient {
             workspace_folders: vec![WorkspaceFolder { uri: root.clone(), name }],
             exited: exited_rx,
             kill: Mutex::new(Some(kill_tx)),
+            watched_files: Mutex::default(),
+            events: in_tx.clone(),
         });
 
         tokio::spawn(write_loop(stdin, out_rx));
@@ -213,6 +221,12 @@ impl LspClient {
 
     pub fn notify<N: Notification>(&self, params: N::Params) -> Result<(), LspError> {
         self.notify_value(N::METHOD, serde_json::to_value(params).expect("params serialize"))
+    }
+
+    /// The file events the server registered interest in through
+    /// `workspace/didChangeWatchedFiles`.
+    pub fn watched_file_events(&self, changes: &[FileEvent]) -> Vec<FileEvent> {
+        self.inner.watched_files.lock().unwrap().filter(changes)
     }
 
     /// Graceful `shutdown` + `exit`, killing the process if it does not exit in time.
@@ -313,9 +327,33 @@ fn answer_server_request(method: &str, params: &Value, inner: &Inner) -> Result<
             Ok(Value::Array(vec![Value::Null; n]))
         }
         "workspace/workspaceFolders" => Ok(serde_json::to_value(&inner.workspace_folders).expect("serialize")),
+        "client/registerCapability" => {
+            let registrations = params.get("registrations").and_then(Value::as_array).cloned().unwrap_or_default();
+            for r in registrations {
+                if r.get("method").and_then(Value::as_str) != Some(watched_files::METHOD) {
+                    continue;
+                }
+                let id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let options = r.get("registerOptions").cloned().unwrap_or(Value::Null);
+                if let Err(e) = inner.watched_files.lock().unwrap().register(id, options) {
+                    let _ = inner.events.send(Incoming::Stderr(format!("[rustcode] {e}")));
+                }
+            }
+            Ok(Value::Null)
+        }
+        "client/unregisterCapability" => {
+            // The LSP spec spells the field "unregisterations".
+            let list = params.get("unregisterations").and_then(Value::as_array).cloned().unwrap_or_default();
+            for u in list {
+                if u.get("method").and_then(Value::as_str) == Some(watched_files::METHOD)
+                    && let Some(id) = u.get("id").and_then(Value::as_str)
+                {
+                    inner.watched_files.lock().unwrap().unregister(id);
+                }
+            }
+            Ok(Value::Null)
+        }
         "window/workDoneProgress/create"
-        | "client/registerCapability"
-        | "client/unregisterCapability"
         | "window/showMessageRequest"
         | "workspace/diagnostic/refresh"
         | "workspace/semanticTokens/refresh"
@@ -338,6 +376,10 @@ fn client_capabilities() -> ClientCapabilities {
         workspace: Some(WorkspaceClientCapabilities {
             configuration: Some(true),
             workspace_folders: Some(true),
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
+            }),
             ..Default::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {

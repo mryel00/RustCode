@@ -3,8 +3,12 @@
 A code editor in the spirit of VS Code, with its core written in Rust.
 Tauri desktop shell, Monaco editor UI, language intelligence via the Language Server Protocol.
 
-**Milestone 1 (this version):** open a folder, browse files, edit with tabs and syntax
+**Milestone 1:** open a folder, browse files, edit with tabs and syntax
 highlighting, save, plus LSP completion, hover, go-to-definition and diagnostics.
+
+**File watching:** external changes reload open files without unsaved changes, deleted
+files are marked in their tab, saving over a newer file asks before overwriting, the
+explorer updates itself, and language servers get `workspace/didChangeWatchedFiles`.
 
 ## Requirements
 
@@ -39,6 +43,7 @@ Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to 
 
 ```sh
 cargo test --workspace   # includes an end-to-end test against a real rust-analyzer
+npm test                 # UI unit tests
 npm run build            # type-checks and bundles the UI
 ```
 

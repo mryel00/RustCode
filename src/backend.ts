@@ -23,6 +23,33 @@ export interface OpenedDocument {
   version: number;
 }
 
+export type FileChangeKind = 'created' | 'changed' | 'deleted';
+
+export interface FsChange {
+  path: string;
+  kind: FileChangeKind;
+}
+
+/** How an open document now relates to its file on disk. */
+export interface DiskChange {
+  uri: string;
+  exists: boolean;
+  /** The file differs from what the document was last loaded from or saved to. */
+  contentChanged: boolean;
+}
+
+export type FsEvent =
+  | { kind: 'changes'; changes: FsChange[]; documents: DiskChange[] }
+  | { kind: 'rescan'; documents: DiskChange[] }
+  | { kind: 'error'; message: string };
+
+export type SaveOutcome = 'saved' | 'conflict';
+
+export interface DiskRead {
+  readId: number;
+  text: string;
+}
+
 export type ContentChange = { range: L.Range; text: string } | { text: string };
 
 export type ServerStatus =
@@ -52,11 +79,15 @@ export const backend = {
   openDocument: (target: { path: string } | { uri: string }) => invoke<OpenedDocument>('open_document', target),
   changeDocument: (uri: string, version: number, changes: ContentChange[]) =>
     invoke<void>('change_document', { uri, version, changes }),
-  saveDocument: (uri: string) => invoke<void>('save_document', { uri }),
+  saveDocument: (uri: string, overwrite = false) => invoke<SaveOutcome>('save_document', { uri, overwrite }),
+  readDocumentFromDisk: (uri: string) => invoke<DiskRead>('read_document_from_disk', { uri }),
+  acceptDiskRead: (uri: string, readId: number) => invoke<void>('accept_disk_read', { uri, readId }),
   closeDocument: (uri: string) => invoke<void>('close_document', { uri }),
   lspRequest: <T>(uri: string, method: string, params: unknown) => invoke<T | null>('lsp_request', { uri, method, params }),
   onLspEvent: (handler: (event: LspEvent) => void): Promise<UnlistenFn> =>
     listen<LspEvent>('lsp-event', (e) => handler(e.payload)),
+  onFsEvent: (handler: (event: FsEvent) => void): Promise<UnlistenFn> =>
+    listen<FsEvent>('fs-event', (e) => handler(e.payload)),
 };
 
 export function errorMessage(err: unknown): string {

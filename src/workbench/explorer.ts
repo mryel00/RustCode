@@ -1,6 +1,6 @@
 // File explorer: a lazily loaded tree of the open folder.
 
-import { backend, errorMessage, type DirEntry } from '../backend';
+import { backend, errorMessage, type DirEntry, type FsChange } from '../backend';
 import { Emitter } from './events';
 
 interface Node {
@@ -16,6 +16,8 @@ export class Explorer {
   private roots: Node[] = [];
   private rootPath: string | null = null;
   private activePath: string | null = null;
+  /** Serializes tree reloads so overlapping refreshes cannot interleave. */
+  private updates: Promise<void> = Promise.resolve();
 
   constructor(private readonly container: HTMLElement) {
     container.addEventListener('click', (e) => this.handleClick(e));
@@ -25,14 +27,67 @@ export class Explorer {
   }
 
   async setRoot(path: string | null): Promise<void> {
-    this.rootPath = path;
-    this.roots = [];
-    if (path) this.roots = await this.load(path, 0);
-    this.render();
+    return this.enqueue(async () => {
+      this.rootPath = path;
+      this.roots = [];
+      if (path) this.roots = await this.load(path, 0);
+      this.render();
+    });
   }
 
   /** Reloads every expanded folder, keeping expansion state. */
-  async refresh(): Promise<void> {
+  refresh(): Promise<void> {
+    return this.enqueue(() => this.doRefresh());
+  }
+
+  /**
+   * Updates the tree for files created or deleted on disk: each affected
+   * folder that is loaded is listed again, keeping the state of folders that
+   * still exist. Collapsed folders just forget their children.
+   */
+  applyChanges(changes: FsChange[]): Promise<void> {
+    const dirs = new Set<string>();
+    for (const c of changes) {
+      if (c.kind !== 'changed') dirs.add(parentPath(c.path));
+    }
+    if (dirs.size === 0) return this.updates;
+    // Parents first: a folder deleted with its parent then simply disappears.
+    const ordered = [...dirs].sort((a, b) => a.length - b.length);
+    return this.enqueue(async () => {
+      if (!this.rootPath) return;
+      let changed = false;
+      for (const dir of ordered) {
+        if (dir === this.rootPath) {
+          this.roots = await this.relist(dir, 0, this.roots);
+          changed = true;
+          continue;
+        }
+        const node = this.find(dir);
+        if (!node?.entry.isDir || !node.children) continue;
+        node.children = node.expanded ? await this.relist(dir, node.depth + 1, node.children) : undefined;
+        changed = true;
+      }
+      if (changed) this.render();
+    });
+  }
+
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    this.updates = this.updates.then(task, task);
+    return this.updates;
+  }
+
+  /** Lists `path` again, carrying over state from `previous` for entries that remain. */
+  private async relist(path: string, depth: number, previous: Node[]): Promise<Node[]> {
+    // The folder may be gone already; its parent's update removes it.
+    const fresh = await this.load(path, depth, { quiet: true });
+    const old = new Map(previous.map((n) => [n.entry.path, n]));
+    return fresh.map((n) => {
+      const prev = old.get(n.entry.path);
+      return prev && prev.entry.isDir === n.entry.isDir ? { ...n, expanded: prev.expanded, children: prev.children } : n;
+    });
+  }
+
+  private async doRefresh(): Promise<void> {
     if (!this.rootPath) return;
     const expanded = new Set<string>();
     const collect = (nodes: Node[]) =>
@@ -62,12 +117,12 @@ export class Explorer {
     }
   }
 
-  private async load(path: string, depth: number): Promise<Node[]> {
+  private async load(path: string, depth: number, { quiet = false } = {}): Promise<Node[]> {
     try {
       const entries = await backend.listDir(path);
       return entries.map((entry) => ({ entry, depth, expanded: false }));
     } catch (err) {
-      this.onError.fire(errorMessage(err));
+      if (!quiet) this.onError.fire(errorMessage(err));
       return [];
     }
   }
@@ -81,17 +136,22 @@ export class Explorer {
     return undefined;
   }
 
-  private async handleClick(e: Event): Promise<void> {
-    const row = (e.target as HTMLElement).closest<HTMLElement>('.tree-row');
-    const node = row?.dataset.path ? this.find(row.dataset.path) : undefined;
-    if (!node) return;
-    if (!node.entry.isDir) {
-      this.onOpenFile.fire(node.entry.path);
+  private handleClick(e: Event): void {
+    const path = (e.target as HTMLElement).closest<HTMLElement>('.tree-row')?.dataset.path;
+    if (!path) return;
+    const file = this.find(path);
+    if (file && !file.entry.isDir) {
+      this.onOpenFile.fire(path);
       return;
     }
-    node.expanded = !node.expanded;
-    if (node.expanded && !node.children) node.children = await this.load(node.entry.path, node.depth + 1);
-    this.render();
+    // Look the node up again inside the queue: an update may have replaced it.
+    void this.enqueue(async () => {
+      const node = this.find(path);
+      if (!node?.entry.isDir) return;
+      node.expanded = !node.expanded;
+      if (node.expanded && !node.children) node.children = await this.load(path, node.depth + 1);
+      this.render();
+    });
   }
 
   private render(): void {
@@ -123,4 +183,11 @@ export class Explorer {
     add(this.roots);
     this.container.replaceChildren(fragment);
   }
+}
+
+function parentPath(path: string): string {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  if (cut < 0) return path;
+  // Keep the separator of a root such as "/" or "C:\".
+  return cut === 0 || path[cut - 1] === ':' ? path.slice(0, cut + 1) : path.slice(0, cut);
 }

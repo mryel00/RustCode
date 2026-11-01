@@ -6,7 +6,9 @@ pub mod fs;
 pub mod language;
 pub mod text;
 pub mod uri;
+pub mod watcher;
 
-pub use document::{Document, DocumentError, DocumentStore};
+pub use document::{DiskChange, DiskRead, DiskStamp, Document, DocumentError, DocumentStore, SaveOutcome};
 pub use fs::{DirEntry, list_dir};
 pub use language::language_id_for_path;
+pub use watcher::{FileChange, FileChangeKind, FileWatcher, WatchEvent};

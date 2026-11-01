@@ -1,6 +1,6 @@
 //! End-to-end test against a real rust-analyzer. Skipped if it is not on PATH.
 
-use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+use lsp_types::{FileChangeType, FileEvent, Position, Range, TextDocumentContentChangeEvent};
 use rc_lsp::{default_servers, LspManager, ManagerEvent, ServerStatus};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -123,6 +123,34 @@ async fn rust_analyzer_end_to_end() {
     })
     .await;
     assert!(completion.to_string().contains("\"total\""));
+
+    // A file created on disk after the project loaded is only seen through
+    // workspace/didChangeWatchedFiles: rust-analyzer registers watchers instead
+    // of watching itself because we advertise dynamic registration.
+    let util = root.join("src/util.rs");
+    std::fs::write(&util, "pub fn helper() -> i32 {\n    42\n}\n").unwrap();
+    let util_uri = rc_core::uri::path_to_uri(&util).unwrap();
+    mgr.files_changed(vec![FileEvent { uri: util_uri.clone(), typ: FileChangeType::CREATED }]);
+    let end = Position::new(9, 0);
+    mgr.change(
+        &uri,
+        2,
+        vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(end, end)),
+            range_length: None,
+            text: "mod util;\nfn answer() -> i32 {\n    util::helper()\n}\n".into(),
+        }],
+    );
+    let helper_params = json!({"textDocument": {"uri": uri}, "position": {"line": 11, "character": 12}});
+    let hover =
+        request_until(&mgr, &uri, "textDocument/hover", helper_params.clone(), |v| v.to_string().contains("fn helper")).await;
+    assert!(hover.to_string().contains("fn helper() -> i32"), "hover: {hover}");
+
+    // rust-analyzer does not re-read a file it already knows unless told it changed.
+    std::fs::write(&util, "pub fn helper() -> u64 {\n    42\n}\n").unwrap();
+    mgr.files_changed(vec![FileEvent { uri: util_uri.clone(), typ: FileChangeType::CHANGED }]);
+    let hover = request_until(&mgr, &uri, "textDocument/hover", helper_params, |v| v.to_string().contains("-> u64")).await;
+    assert!(hover.to_string().contains("fn helper() -> u64"), "hover: {hover}");
 
     mgr.close(&uri);
     mgr.shutdown().await;

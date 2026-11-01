@@ -213,6 +213,11 @@ body:not(.has-workspace) #refresh-explorer {
   text-overflow: ellipsis;
 }
 
+/* The file was deleted on disk (VS Code strikes the label through). */
+.tab.deleted .tab-label {
+  text-decoration: line-through;
+}
+
 .tab-close {
   width: 20px;
   height: 20px;

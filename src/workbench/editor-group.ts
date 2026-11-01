@@ -60,6 +60,7 @@ export class EditorGroup {
       if (e.button === 1) this.handleTabClick(e, true);
     });
     docs.onDidChangeDirty.on(() => this.renderTabs());
+    docs.onDidChangeOrphaned.on(() => this.renderTabs());
     this.renderTabs();
   }
 
@@ -149,10 +150,11 @@ export class EditorGroup {
       tab.className = 'tab';
       tab.setAttribute('role', 'tab');
       tab.dataset.uri = doc.uri;
-      tab.title = doc.path;
+      tab.title = doc.orphaned ? `${doc.path} (deleted)` : doc.path;
       const dirty = this.docs.isDirty(doc);
       tab.classList.toggle('active', doc === this.active);
       tab.classList.toggle('dirty', dirty);
+      tab.classList.toggle('deleted', doc.orphaned);
       tab.setAttribute('aria-selected', String(doc === this.active));
 
       const label = document.createElement('span');

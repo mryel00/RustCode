@@ -11,8 +11,10 @@ use crate::{
     config::ServerConfig,
 };
 use lsp_types::{
-    notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument},
-    Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    notification::{
+        DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    },
+    Diagnostic, DidChangeTextDocumentParams, DidChangeWatchedFilesParams, FileEvent, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, HoverProviderCapability, MessageType, OneOf, PublishDiagnosticsParams,
     ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncSaveOptions,
@@ -57,6 +59,7 @@ enum Cmd {
     Change { uri: Url, version: i32, changes: Vec<TextDocumentContentChangeEvent> },
     Save { uri: Url },
     Close { uri: Url },
+    FilesChanged { changes: Vec<FileEvent> },
     Request { method: String, params: Value, reply: oneshot::Sender<Result<Value, LspError>> },
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -112,6 +115,17 @@ impl LspManager {
     pub fn close(&self, uri: &Url) {
         self.send_for(uri, Cmd::Close { uri: uri.clone() });
         self.docs.lock().unwrap().remove(uri);
+    }
+
+    /// Tells every running server about file changes in the workspace. Each
+    /// server only gets the events matching its registered watchers.
+    pub fn files_changed(&self, changes: Vec<FileEvent>) {
+        if changes.is_empty() {
+            return;
+        }
+        for tx in self.servers.lock().unwrap().values() {
+            let _ = tx.send(Cmd::FilesChanged { changes: changes.clone() });
+        }
     }
 
     /// Sends a request to the server that owns `uri`. Resolves to `null` when the
@@ -293,6 +307,12 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
                 let _ = client.notify::<DidCloseTextDocument>(DidCloseTextDocumentParams {
                     text_document: TextDocumentIdentifier { uri },
                 });
+            }
+        }
+        Cmd::FilesChanged { changes } => {
+            let changes = client.watched_file_events(&changes);
+            if !changes.is_empty() {
+                let _ = client.notify::<DidChangeWatchedFiles>(DidChangeWatchedFilesParams { changes });
             }
         }
         Cmd::Request { method, params, reply } => {

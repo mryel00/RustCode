@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 log.workspace = true
 which.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

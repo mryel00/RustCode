@@ -1,9 +1,10 @@
 // Open documents: one Monaco model per backend document, kept in sync with the
 // Rust document store.
 
-import { backend, errorMessage, type ContentChange } from '../backend';
+import { backend, errorMessage, type ContentChange, type DiskChange, type SaveOutcome } from '../backend';
 import { monaco, monacoLanguage } from '../monaco/setup';
 import { Emitter } from './events';
+import { computeTextUpdate } from './text-update';
 
 /** Runs async tasks one after another. */
 class SerialQueue {
@@ -32,6 +33,28 @@ export interface Doc {
   version: number;
   savedAltVersionId: number;
   readonly sync: SerialQueue;
+  /** The file was deleted on disk; the document stays open. */
+  orphaned: boolean;
+  /** Reloads from disk, one at a time. */
+  readonly reloads: SerialQueue;
+  reloadQueued: boolean;
+}
+
+/**
+ * Brings `model` to `text` with one minimal edit, so cursors, folding and
+ * undo history survive (VS Code's `ModelService.updateModel`).
+ */
+export function updateModelText(model: monaco.editor.ITextModel, text: string): void {
+  const update = computeTextUpdate(model.getLinesContent(), model.getEOL(), text);
+  if (!update.eol && !update.edit) return;
+  model.pushStackElement();
+  if (update.eol) {
+    model.pushEOL(update.eol === '\r\n' ? monaco.editor.EndOfLineSequence.CRLF : monaco.editor.EndOfLineSequence.LF);
+  }
+  if (update.edit) {
+    model.pushEditOperations([], [{ ...update.edit, forceMoveMarkers: true }], () => null);
+  }
+  model.pushStackElement();
 }
 
 /** Normalizes URI spellings (e.g. %3A vs :) so lookups match across sources. */
@@ -45,6 +68,7 @@ export class Documents {
   readonly onDidOpen = new Emitter<Doc>();
   readonly onDidClose = new Emitter<Doc>();
   readonly onDidChangeDirty = new Emitter<Doc>();
+  readonly onDidChangeOrphaned = new Emitter<Doc>();
   readonly onError = new Emitter<string>();
 
   get(uri: string | monaco.Uri): Doc | undefined {
@@ -90,6 +114,9 @@ export class Documents {
         version: opened.version,
         savedAltVersionId: model.getAlternativeVersionId(),
         sync: new SerialQueue(),
+        orphaned: false,
+        reloads: new SerialQueue(),
+        reloadQueued: false,
       };
       model.onDidChangeContent((e) => this.handleChange(doc, e));
       this.docs.set(uriKey(opened.uri), doc);
@@ -104,12 +131,70 @@ export class Documents {
     }
   }
 
-  async save(doc: Doc): Promise<void> {
+  /**
+   * Saves the document. Resolves to `conflict` without writing when the file
+   * changed on disk since it was loaded or last saved, unless `overwrite`.
+   */
+  async save(doc: Doc, overwrite = false): Promise<SaveOutcome> {
     const savedAlt = doc.model.getAlternativeVersionId();
     // Saving goes through the queue so every edit typed so far reaches disk.
-    await doc.sync.run(() => backend.saveDocument(doc.uri));
-    doc.savedAltVersionId = savedAlt;
+    const outcome = await doc.sync.run(() => backend.saveDocument(doc.uri, overwrite));
+    if (outcome === 'saved') {
+      doc.savedAltVersionId = savedAlt;
+      this.setOrphaned(doc, false);
+      this.onDidChangeDirty.fire(doc);
+    }
+    return outcome;
+  }
+
+  /**
+   * Replaces the document's contents with its file on disk (VS Code's
+   * "Revert File"). With `onlyIfClean`, gives up if the document has unsaved
+   * changes by the time the file is read. Resolves to whether it reverted.
+   */
+  async revert(doc: Doc, { onlyIfClean = false } = {}): Promise<boolean> {
+    if (onlyIfClean && this.isDirty(doc)) return false;
+    const read = await backend.readDocumentFromDisk(doc.uri);
+    if (doc.model.isDisposed() || this.get(doc.uri) !== doc) return false;
+    if (onlyIfClean && this.isDirty(doc)) return false;
+    // The edits travel to the backend through the sync queue like typing does;
+    // the read is accepted after them, so the backend knows the buffer and the
+    // file agree again.
+    updateModelText(doc.model, read.text);
+    doc.savedAltVersionId = doc.model.getAlternativeVersionId();
+    this.setOrphaned(doc, false);
     this.onDidChangeDirty.fire(doc);
+    await doc.sync.run(() => backend.acceptDiskRead(doc.uri, read.readId));
+    return true;
+  }
+
+  /** Applies disk changes reported by the file watcher. */
+  handleDiskChanges(changes: DiskChange[]): void {
+    for (const change of changes) {
+      const doc = this.get(change.uri);
+      if (!doc) continue;
+      this.setOrphaned(doc, !change.exists);
+      // Like VS Code: documents without unsaved changes follow the disk;
+      // modified ones keep their changes and saving reports the conflict.
+      if (change.exists && change.contentChanged && !this.isDirty(doc)) this.scheduleReload(doc);
+    }
+  }
+
+  private scheduleReload(doc: Doc): void {
+    if (doc.reloadQueued) return;
+    doc.reloadQueued = true;
+    void doc.reloads
+      .run(() => {
+        doc.reloadQueued = false;
+        return this.revert(doc, { onlyIfClean: true });
+      })
+      .catch((err) => this.onError.fire(`Could not reload ${doc.name} from disk: ${errorMessage(err)}`));
+  }
+
+  private setOrphaned(doc: Doc, orphaned: boolean): void {
+    if (doc.orphaned === orphaned) return;
+    doc.orphaned = orphaned;
+    this.onDidChangeOrphaned.fire(doc);
   }
 
   async close(doc: Doc): Promise<void> {
