@@ -7,10 +7,18 @@
 //! `.gitignore`, `.ignore`, `.rgignore` and `-g` style globs behave exactly as
 //! with `rg`.
 //!
+//! Exclude exceptions (`!`-prefixed keys of `files.exclude`/`search.exclude`)
+//! re-include paths that other excludes or ignore files leave out. ripgrep
+//! does not descend into excluded folders, so, like VS Code, a second walk
+//! visits only the paths the exceptions lead to.
+//!
 //! Positions are reported as (line, UTF-16 column), like every other position
 //! in RustCode. Line breaks are `\n`, `\r\n` and `\r`.
 
-use crate::{fs::FILES_EXCLUDE, uri};
+use crate::{
+    glob::{self, expand_braces, split_glob_aware, ExcludeExpression, ExcludeValue, ParsedExclude},
+    uri,
+};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::{
     overrides::{Override, OverrideBuilder},
@@ -22,7 +30,10 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
 };
 use url::Url;
 
@@ -35,9 +46,7 @@ pub const DEFAULT_MAX_RESULTS: usize = 20_000;
 /// Longest full match text sent along with a multi-line match.
 const MAX_MATCH_TEXT: usize = 10_000;
 
-/// Glob matching follows the file system's case sensitivity, like VS Code's
-/// `ignoreGlobCase`.
-const GLOB_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+const GLOB_CASE_INSENSITIVE: bool = glob::CASE_INSENSITIVE;
 
 /// A search as entered in the Search view.
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +144,9 @@ pub struct TextSearch {
     /// VS Code's own glob check of every result (`QueryGlobTester`): the
     /// globs above can let through more than the patterns mean.
     filter: ResultFilter,
+    /// Globs of the second walk, which visits what exclude exceptions
+    /// re-include (`None` without exceptions).
+    exception_overrides: Option<Override>,
     use_ignore_files: bool,
     max_results: usize,
     /// The whole folder is excluded (`./` in "files to exclude").
@@ -143,7 +155,14 @@ pub struct TextSearch {
 
 impl TextSearch {
     /// Compiles `query` for searching `root` (an absolute, canonical folder).
-    pub fn new(root: &Path, query: &TextSearchQuery) -> Result<Self, SearchError> {
+    /// `settings_excludes` are `files.exclude` and `search.exclude` merged
+    /// (see [`WorkspaceSettings::search_excludes`](crate::settings::WorkspaceSettings::search_excludes)),
+    /// applied unless the query turns exclude settings off.
+    pub fn new(
+        root: &Path,
+        query: &TextSearchQuery,
+        settings_excludes: &ExcludeExpression,
+    ) -> Result<Self, SearchError> {
         if query.pattern.is_empty() {
             return Err(SearchError("the search pattern is empty".into()));
         }
@@ -152,15 +171,21 @@ impl TextSearch {
 
         let includes = parse_patterns(&query.includes, root)?;
         let excludes = parse_patterns(&query.excludes, root)?;
-        let mut exclude_globs = Vec::new();
-        if query.use_exclude_settings_and_ignore_files {
-            exclude_globs.extend(FILES_EXCLUDE.iter().map(|name| format!("**/{name}")));
-            exclude_globs.extend(SEARCH_EXCLUDE.iter().map(|g| g.to_string()));
+        // Typed patterns are not settings: a leading `!` is literal there.
+        let mut exclude_expr = ExcludeExpression::default();
+        for pattern in &excludes.globs {
+            exclude_expr.set(glob::escape_exception(pattern), ExcludeValue::Enabled(true));
         }
-        exclude_globs.extend(excludes.globs);
+        if query.use_exclude_settings_and_ignore_files {
+            exclude_expr = exclude_expr.merged(settings_excludes);
+        }
         let include_globs = if includes.whole_folder { Vec::new() } else { includes.globs };
-        let overrides = build_overrides(root, &include_globs, &exclude_globs)?;
-        let filter = ResultFilter::new(&include_globs, &exclude_globs)?;
+        let overrides = build_overrides(root, &include_globs, &exclude_expr.plain_patterns())?;
+        let parsed = exclude_expr.parse().map_err(|e| SearchError(e.to_string()))?;
+        let exceptions = exclude_expr.exceptions();
+        let exception_overrides =
+            if exceptions.is_empty() { None } else { Some(build_exception_overrides(root, &exceptions)?) };
+        let filter = ResultFilter::new(&include_globs, parsed)?;
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -170,6 +195,7 @@ impl TextSearch {
             chars_per_line: if query.is_regex { 10_000 } else { 1_000 },
             overrides,
             filter,
+            exception_overrides,
             use_ignore_files: query.use_exclude_settings_and_ignore_files,
             max_results: query.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
             root_excluded: excludes.whole_folder,
@@ -184,19 +210,21 @@ impl TextSearch {
             return false;
         }
         let Ok(rel) = path.strip_prefix(&self.root) else { return false };
-        let components: Vec<_> = rel.components().collect();
-        let mut current = self.root.clone();
-        for (i, component) in components.iter().enumerate() {
-            current.push(component);
-            let is_dir = i + 1 < components.len();
-            if self.overrides.matched(&current, is_dir).is_ignore() {
-                return false;
-            }
-            if !is_dir {
-                return self.filter.includes(rel);
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        // What an exception re-includes stays in, whatever excludes its folders.
+        if !self.filter.is_excepted(rel) {
+            let components: Vec<_> = rel.components().collect();
+            let mut current = self.root.clone();
+            for (i, component) in components.iter().enumerate() {
+                current.push(component);
+                if self.overrides.matched(&current, i + 1 < components.len()).is_ignore() {
+                    return false;
+                }
             }
         }
-        false
+        self.filter.includes(path, rel)
     }
 
     /// Searches the folder on disk, calling `on_file` (from several threads)
@@ -209,8 +237,11 @@ impl TextSearch {
         if self.root_excluded {
             return SearchComplete { limit_hit: false };
         }
-        let total = AtomicUsize::new(0);
-        let limit_hit = AtomicBool::new(false);
+        let mut state = RunState {
+            total: AtomicUsize::new(0),
+            limit_hit: AtomicBool::new(false),
+            reported: self.exception_overrides.as_ref().map(|_| Mutex::new(HashSet::new())),
+        };
         let use_ignore = self.use_ignore_files;
 
         // The equivalent of VS Code's `rg --hidden --no-require-git --follow
@@ -231,44 +262,81 @@ impl TextSearch {
         if use_ignore {
             builder.add_custom_ignore_filename(".rgignore");
         }
+        self.walk(&builder, &state, skip, cancel, &on_file, &|path, rel| self.filter.includes(path, rel));
 
+        // VS Code's exception run: only the paths that exceptions lead to,
+        // without ignore files (exceptions override them), skipping files
+        // the first walk reported.
+        if let Some(overrides) = &self.exception_overrides
+            && !state.limit_hit.load(Ordering::Relaxed)
+            && !cancel.load(Ordering::Relaxed)
+        {
+            let reported = state.reported.take().map(|r| r.into_inner().unwrap()).unwrap_or_default();
+            let mut builder = WalkBuilder::new(&self.root);
+            builder
+                .standard_filters(false)
+                .parents(false)
+                .require_git(false)
+                .follow_links(true)
+                .overrides(overrides.clone())
+                .threads(0);
+            self.walk(&builder, &state, skip, cancel, &on_file, &|path, rel| {
+                !reported.contains(path) && self.filter.is_excepted(rel) && self.filter.includes(path, rel)
+            });
+        }
+        SearchComplete { limit_hit: state.limit_hit.load(Ordering::Relaxed) }
+    }
+
+    /// One parallel walk: searches the files `accept` lets through.
+    fn walk(
+        &self,
+        builder: &WalkBuilder,
+        state: &RunState,
+        skip: &HashSet<PathBuf>,
+        cancel: &AtomicBool,
+        on_file: &(dyn Fn(FileMatches) + Sync),
+        accept: &(dyn Fn(&Path, &Path) -> bool + Sync),
+    ) {
         builder.build_parallel().run(|| {
             Box::new(|entry| {
-                if cancel.load(Ordering::Relaxed) || limit_hit.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) || state.limit_hit.load(Ordering::Relaxed) {
                     return WalkState::Quit;
                 }
                 let Ok(entry) = entry else { return WalkState::Continue };
-                if !entry.file_type().is_some_and(|t| t.is_file()) || skip.contains(entry.path()) {
+                let path = entry.path();
+                if !entry.file_type().is_some_and(|t| t.is_file()) || skip.contains(path) {
                     return WalkState::Continue;
                 }
-                if !entry.path().strip_prefix(&self.root).is_ok_and(|rel| self.filter.includes(rel)) {
+                if !path.strip_prefix(&self.root).is_ok_and(|rel| accept(path, rel)) {
                     return WalkState::Continue;
                 }
                 // One more than the remaining budget, to learn whether the
                 // limit is exceeded.
-                let cap = self.max_results.saturating_sub(total.load(Ordering::Relaxed)) + 1;
-                let Some(mut matches) = self.search_file(entry.path(), cap) else { return WalkState::Continue };
+                let cap = self.max_results.saturating_sub(state.total.load(Ordering::Relaxed)) + 1;
+                let Some(mut matches) = self.search_file(path, cap) else { return WalkState::Continue };
                 if matches.is_empty() {
                     return WalkState::Continue;
                 }
-                let before = total.fetch_add(matches.len(), Ordering::Relaxed);
+                let before = state.total.fetch_add(matches.len(), Ordering::Relaxed);
                 if before + matches.len() > self.max_results {
-                    limit_hit.store(true, Ordering::Relaxed);
+                    state.limit_hit.store(true, Ordering::Relaxed);
                     matches.truncate(self.max_results.saturating_sub(before));
                 }
                 if !matches.is_empty()
-                    && let Some(uri) = uri::path_to_uri(entry.path())
+                    && let Some(uri) = uri::path_to_uri(path)
                 {
-                    on_file(FileMatches { uri, path: entry.path().to_string_lossy().into_owned(), matches });
+                    if let Some(reported) = &state.reported {
+                        reported.lock().unwrap().insert(path.to_path_buf());
+                    }
+                    on_file(FileMatches { uri, path: path.to_string_lossy().into_owned(), matches });
                 }
-                if limit_hit.load(Ordering::Relaxed) {
+                if state.limit_hit.load(Ordering::Relaxed) {
                     WalkState::Quit
                 } else {
                     WalkState::Continue
                 }
             })
         });
-        SearchComplete { limit_hit: limit_hit.load(Ordering::Relaxed) }
     }
 
     /// Searches one file on disk. `None` for unreadable and binary files.
@@ -482,9 +550,6 @@ fn parse_patterns(input: &str, root: &Path) -> Result<PatternSet, SearchError> {
     let mut set = PatternSet::default();
     for segment in split_glob_aware(input, ',').iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let segment = untildify(segment);
-        if segment.starts_with('!') {
-            return Err(SearchError(format!("Exclude exceptions (\"{segment}\") are not supported yet")));
-        }
         if is_search_path(&segment) {
             let (path_portion, glob_portion) = split_glob_from_path(&segment);
             let glob_portion = glob_portion.map(|g| normalize_glob_pattern(&g)).filter(|g| !g.is_empty());
@@ -595,89 +660,6 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// VS Code's `glob.splitGlobAware`: splits on `split` outside `{}` and `[]`.
-fn split_glob_aware(pattern: &str, split: char) -> Vec<String> {
-    let mut segments = Vec::new();
-    let (mut in_braces, mut in_brackets) = (false, false);
-    let mut current = String::new();
-    for c in pattern.chars() {
-        if c == split && !in_braces && !in_brackets {
-            segments.push(std::mem::take(&mut current));
-            continue;
-        }
-        match c {
-            '{' => in_braces = true,
-            '}' => in_braces = false,
-            '[' => in_brackets = true,
-            ']' => in_brackets = false,
-            _ => {}
-        }
-        current.push(c);
-    }
-    if !current.is_empty() {
-        segments.push(current);
-    }
-    segments
-}
-
-/// Expands `{a,b}` alternatives (nested ones too); `\{` is literal.
-fn expand_braces(pattern: &str) -> Vec<String> {
-    let mut depth = 0usize;
-    let mut open = 0;
-    let mut escaped = false;
-    for (i, c) in pattern.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '{' => {
-                if depth == 0 {
-                    open = i;
-                }
-                depth += 1;
-            }
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    let (prefix, inner, suffix) = (&pattern[..open], &pattern[open + 1..i], &pattern[i + 1..]);
-                    return split_alternatives(inner)
-                        .into_iter()
-                        .flat_map(|alt| expand_braces(&format!("{prefix}{alt}{suffix}")))
-                        .collect();
-                }
-            }
-            _ => {}
-        }
-    }
-    vec![pattern.to_owned()]
-}
-
-/// Splits brace contents on commas that are not nested or escaped.
-fn split_alternatives(inner: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let (mut depth, mut start, mut escaped) = (0usize, 0, false);
-    for (i, c) in inner.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&inner[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&inner[start..]);
-    parts
-}
-
 /// `foo/*bar/x` → `foo`, `foo/*bar`, `foo/*bar/x`, so that ripgrep descends
 /// into the folders leading to an anchored include.
 fn spread_glob_components(glob: &str) -> Vec<String> {
@@ -723,34 +705,94 @@ fn build_overrides(root: &Path, includes: &[String], excludes: &[String]) -> Res
     builder.build().map_err(glob_error)
 }
 
-/// Include/exclude globs with VS Code's glob semantics, tested against a
-/// file's path relative to the folder.
+/// VS Code's `getExcludeExceptionGlobs`: ripgrep globs that walk only the
+/// folders leading to the exceptions and the paths beneath them.
+fn build_exception_overrides(root: &Path, exceptions: &[String]) -> Result<Override, SearchError> {
+    let expanded: Vec<String> = exceptions.iter().flat_map(|e| expand_braces(e)).collect();
+    let mut globs: Vec<String> = Vec::new();
+    let mut push = |glob: String| {
+        if !globs.contains(&glob) {
+            globs.push(glob);
+        }
+    };
+    // Unless an exception can match at any depth (which needs the whole
+    // folder anyway), only walk the folders that lead to the exceptions.
+    if !expanded.iter().any(|e| e.starts_with("**")) {
+        push("!*".into());
+        for exception in &expanded {
+            let segments = split_glob_aware(exception, '/');
+            for i in 1..segments.len() {
+                // A trailing slash only matches folders.
+                push(format!("{}/", anchor_glob(&segments[..i].join("/"))));
+            }
+        }
+    }
+    for exception in &expanded {
+        push(anchor_glob(exception));
+        push(anchor_glob(&format!("{exception}/**")));
+    }
+    // Later globs take precedence.
+    for folder in glob::folders_skipped_by_exceptions(exceptions) {
+        push(format!("!**/{folder}"));
+    }
+    let mut builder = OverrideBuilder::new(root);
+    builder.case_insensitive(GLOB_CASE_INSENSITIVE).map_err(glob_error)?;
+    for glob in &globs {
+        builder.add(glob).map_err(glob_error)?;
+    }
+    builder.build().map_err(glob_error)
+}
+
+/// Counters shared by the threads of a search.
+struct RunState {
+    total: AtomicUsize,
+    limit_hit: AtomicBool,
+    /// Files reported so far, when a second walk must skip them.
+    reported: Option<Mutex<HashSet<PathBuf>>>,
+}
+
+/// Include patterns and the exclude expression, with VS Code's glob
+/// semantics, tested against a file's path relative to the folder.
 struct ResultFilter {
     include: Option<GlobSet>,
-    exclude: GlobSet,
+    exclude: ParsedExclude,
 }
 
 impl ResultFilter {
-    fn new(includes: &[String], excludes: &[String]) -> Result<Self, SearchError> {
-        let set = |globs: &[String]| -> Result<GlobSet, SearchError> {
+    fn new(includes: &[String], exclude: ParsedExclude) -> Result<Self, SearchError> {
+        let include = if includes.is_empty() {
+            None
+        } else {
             let mut builder = GlobSetBuilder::new();
-            for glob in globs {
-                let glob = GlobBuilder::new(glob)
-                    .literal_separator(true)
-                    .case_insensitive(GLOB_CASE_INSENSITIVE)
-                    .build()
-                    .map_err(|e| SearchError(format!("Invalid glob pattern: {e}")))?;
-                builder.add(glob);
+            for pattern in includes {
+                builder.add(
+                    GlobBuilder::new(pattern)
+                        .literal_separator(true)
+                        .case_insensitive(GLOB_CASE_INSENSITIVE)
+                        .build()
+                        .map_err(|e| SearchError(format!("Invalid glob pattern: {e}")))?,
+                );
             }
-            builder.build().map_err(|e| SearchError(format!("Invalid glob pattern: {e}")))
+            Some(builder.build().map_err(|e| SearchError(format!("Invalid glob pattern: {e}")))?)
         };
-        Ok(Self { include: if includes.is_empty() { None } else { Some(set(includes)?) }, exclude: set(excludes)? })
+        Ok(Self { include, exclude })
     }
 
-    fn includes(&self, rel: &Path) -> bool {
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        !self.exclude.is_match(&rel) && self.include.as_ref().is_none_or(|inc| inc.is_match(&rel))
+    /// `path` is the absolute path (for sibling clauses), `rel` the same
+    /// path relative to the folder.
+    fn includes(&self, path: &Path, rel: &Path) -> bool {
+        let rel = slashed(rel);
+        let has_sibling = |name: &str| path.parent().is_some_and(|dir| dir.join(name).exists());
+        !self.exclude.matches(&rel, &has_sibling) && self.include.as_ref().is_none_or(|inc| inc.is_match(&rel))
     }
+
+    fn is_excepted(&self, rel: &Path) -> bool {
+        self.exclude.is_excepted(&slashed(rel))
+    }
+}
+
+fn slashed(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 fn glob_error(err: ignore::Error) -> SearchError {
@@ -923,6 +965,10 @@ mod tests {
     /// `relative path → [(line, start column, end column)]`, sorted.
     type Results = Vec<(String, Vec<(u32, u32, u32)>)>;
 
+    fn defaults() -> ExcludeExpression {
+        crate::settings::WorkspaceSettings::default().search_excludes()
+    }
+
     fn query(pattern: &str) -> TextSearchQuery {
         TextSearchQuery::new(pattern)
     }
@@ -943,12 +989,17 @@ mod tests {
         run_full(root, q, &HashSet::new()).0
     }
 
-    fn run_full(
+    fn run_full(root: &Path, q: &TextSearchQuery, skip: &HashSet<PathBuf>) -> (Results, SearchComplete) {
+        run_with(root, q, skip, &defaults())
+    }
+
+    fn run_with(
         root: &Path,
         q: &TextSearchQuery,
         skip: &HashSet<PathBuf>,
+        excludes: &ExcludeExpression,
     ) -> (Results, SearchComplete) {
-        let search = TextSearch::new(root, q).unwrap();
+        let search = TextSearch::new(root, q, excludes).unwrap();
         let found = Mutex::new(Vec::new());
         let complete = search.run(skip, &AtomicBool::new(false), |f| found.lock().unwrap().push(f));
         let mut found: Vec<_> = found
@@ -971,7 +1022,7 @@ mod tests {
     }
 
     fn matches_in(text: &str, q: &TextSearchQuery) -> Vec<TextMatch> {
-        TextSearch::new(Path::new("/"), q).unwrap().search_text(text, usize::MAX)
+        TextSearch::new(Path::new("/"), q, &defaults()).unwrap().search_text(text, usize::MAX)
     }
 
     #[test]
@@ -1033,7 +1084,9 @@ mod tests {
         assert_eq!(matches_in("foobar foobaz", &q).len(), 1);
         let q = TextSearchQuery { is_regex: true, ..query("(\\w)\\1") };
         assert_eq!(matches_in("abba", &q).len(), 1);
-        let err = TextSearch::new(Path::new("/"), &TextSearchQuery { is_regex: true, ..query("(") }).err().unwrap();
+        let err = TextSearch::new(Path::new("/"), &TextSearchQuery { is_regex: true, ..query("(") }, &defaults())
+            .err()
+            .unwrap();
         assert!(err.0.contains("unclosed group"), "{err}");
     }
 
@@ -1095,20 +1148,20 @@ mod tests {
         assert!(with("", "./").is_empty());
         assert_eq!(with("./", "").len(), 5);
         let outside = TextSearchQuery { includes: "../elsewhere".into(), ..query("hit") };
-        assert!(TextSearch::new(&root, &outside).is_err());
+        assert!(TextSearch::new(&root, &outside, &defaults()).is_err());
     }
 
     #[test]
     fn scope_check_for_open_documents_ignores_gitignore_but_not_globs() {
         let (_dir, root) = folder(&[(".gitignore", "gen/\n")]);
         let q = TextSearchQuery { excludes: "*.lock".into(), ..query("x") };
-        let search = TextSearch::new(&root, &q).unwrap();
+        let search = TextSearch::new(&root, &q, &defaults()).unwrap();
         assert!(search.in_scope(&root.join("gen/a.rs")));
         assert!(!search.in_scope(&root.join("Cargo.lock")));
         assert!(!search.in_scope(&root.join("node_modules/x/a.js")));
         assert!(!search.in_scope(Path::new("/elsewhere/a.rs")));
         let q = TextSearchQuery { includes: "./src".into(), ..query("x") };
-        let search = TextSearch::new(&root, &q).unwrap();
+        let search = TextSearch::new(&root, &q, &defaults()).unwrap();
         assert!(search.in_scope(&root.join("src/deep/a.rs")));
         assert!(!search.in_scope(&root.join("other/a.rs")));
     }
@@ -1145,5 +1198,77 @@ mod tests {
                 && is_multiline_regex_source("\\W")
                 && !is_multiline_regex_source("\\\\n")
         );
+    }
+
+    fn settings(json: &str) -> ExcludeExpression {
+        crate::settings::WorkspaceSettings::parse(json).unwrap().search_excludes()
+    }
+
+    fn found_with(root: &Path, q: &TextSearchQuery, excludes: &ExcludeExpression) -> Vec<String> {
+        files(&run_with(root, q, &HashSet::new(), excludes).0).into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn exclude_exceptions_reinclude_excluded_and_ignored_paths() {
+        let (_dir, root) = folder(&[
+            ("node_modules/keep/a.txt", "hit"),
+            ("node_modules/keep/sub/b.txt", "hit"),
+            ("node_modules/other/c.txt", "hit"),
+            ("src/d.txt", "hit"),
+            ("gen/out.txt", "hit"),
+            ("gen/skip.txt", "hit"),
+            (".gitignore", "gen/\n"),
+        ]);
+        let excludes =
+            settings(r#"{ "search.exclude": { "!node_modules/keep": true, "!gen/out.txt": true, "!src": true } }"#);
+        assert_eq!(
+            found_with(&root, &query("hit"), &excludes),
+            ["gen/out.txt", "node_modules/keep/a.txt", "node_modules/keep/sub/b.txt", "src/d.txt"]
+        );
+        // Include patterns still apply to what exceptions re-include.
+        let q = TextSearchQuery { includes: "./node_modules/keep/sub".into(), ..query("hit") };
+        assert_eq!(found_with(&root, &q, &excludes), ["node_modules/keep/sub/b.txt"]);
+        // Exceptions are settings: turning exclude settings off drops them along with the excludes.
+        let off = TextSearchQuery { use_exclude_settings_and_ignore_files: false, ..query("hit") };
+        assert_eq!(found_with(&root, &off, &excludes).len(), 6);
+        // Typed excludes are overridden too, like in VS Code.
+        let typed = TextSearchQuery { excludes: "node_modules".into(), ..query("hit") };
+        assert!(found_with(&root, &typed, &excludes).contains(&"node_modules/keep/a.txt".to_owned()));
+    }
+
+    #[test]
+    fn exceptions_at_any_depth_skip_version_control_folders() {
+        let (_dir, root) = folder(&[("a/keep.log", "hit"), ("a/other.log", "hit"), (".git/keep.log", "hit")]);
+        let excludes = settings(r#"{ "files.exclude": { "**/*.log": true, "!**/keep.log": true } }"#);
+        assert_eq!(found_with(&root, &query("hit"), &excludes), ["a/keep.log"]);
+        let named = settings(r#"{ "files.exclude": { "!.git/keep.log": true } }"#);
+        assert_eq!(found_with(&root, &query("hit"), &named), [".git/keep.log", "a/keep.log", "a/other.log"]);
+    }
+
+    #[test]
+    fn typed_exclamation_marks_are_literal() {
+        let (_dir, root) = folder(&[("!odd/a.txt", "hit"), ("odd/b.txt", "hit")]);
+        for excludes in ["./!odd", "!odd"] {
+            let q = TextSearchQuery { excludes: excludes.into(), ..query("hit") };
+            assert_eq!(found_with(&root, &q, &defaults()), ["odd/b.txt"], "{excludes}");
+        }
+    }
+
+    #[test]
+    fn sibling_clauses_hide_generated_files() {
+        let (_dir, root) = folder(&[("a.ts", "hit"), ("a.js", "hit"), ("b.js", "hit")]);
+        let excludes = settings(r#"{ "files.exclude": { "**/*.js": { "when": "$(basename).ts" } } }"#);
+        assert_eq!(found_with(&root, &query("hit"), &excludes), ["a.ts", "b.js"]);
+    }
+
+    #[test]
+    fn open_documents_reincluded_by_exceptions_are_in_scope() {
+        let (_dir, root) = folder(&[]);
+        let excludes = settings(r#"{ "search.exclude": { "!node_modules/keep": true } }"#);
+        let search = TextSearch::new(&root, &query("x"), &excludes).unwrap();
+        assert!(search.in_scope(&root.join("node_modules/keep/a.js")));
+        assert!(!search.in_scope(&root.join("node_modules/other/a.js")));
+        let q = TextSearchQuery { includes: "*.ts".into(), ..query("x") };
+        assert!(!TextSearch::new(&root, &q, &excludes).unwrap().in_scope(&root.join("node_modules/keep/a.js")));
     }
 }

@@ -7,8 +7,11 @@
 
 use lsp_types::{FileChangeType, FileEvent, TextDocumentContentChangeEvent};
 use rc_core::{
-    watcher::DEFAULT_EXCLUDES, DirEntry, DiskChange, DiskRead, DiskStamp, DocumentStore, FileChange, FileChangeKind,
-    FileMatches, FileWatcher, SaveOutcome, TextSearch, TextSearchQuery, WatchEvent,
+    glob::{ExcludeExpression, ParsedExclude},
+    settings::{settings_path, WorkspaceSettings},
+    watcher::DEFAULT_EXCLUDES,
+    DirEntry, DiskChange, DiskRead, DiskStamp, DocumentStore, FileChange, FileChangeKind, FileMatches, FileWatcher,
+    SaveOutcome, TextSearch, TextSearchQuery, WatchEvent,
 };
 use rc_lsp::{LspManager, ManagerEvent};
 use serde::Serialize;
@@ -60,6 +63,28 @@ struct Session {
     watcher: Option<FileWatcher>,
     /// The running text search, if any. Starting another one cancels it.
     search: Option<ActiveSearch>,
+    /// From `.vscode/settings.json`; reloaded when that file changes.
+    settings: Arc<Settings>,
+}
+
+/// Workspace settings, prepared for the explorer and search.
+struct Settings {
+    files_exclude: ParsedExclude,
+    search_excludes: ExcludeExpression,
+    warnings: Vec<String>,
+}
+
+impl Settings {
+    fn load(root: &std::path::Path) -> Self {
+        let settings = WorkspaceSettings::load(root);
+        // Settings patterns are validated while loading, so parsing succeeds.
+        let files_exclude = settings
+            .files_exclude
+            .parse()
+            .or_else(|_| WorkspaceSettings::default().files_exclude.parse())
+            .expect("default excludes are valid");
+        Self { files_exclude, search_excludes: settings.search_excludes(), warnings: settings.warnings }
+    }
 }
 
 struct ActiveSearch {
@@ -94,6 +119,9 @@ enum FsEvent {
     Rescan { documents: Vec<DiskChange> },
     /// Watching failed; external changes may go unnoticed.
     Error { message: String },
+    /// `.vscode/settings.json` changed and was loaded again: the explorer
+    /// shows what `files.exclude` now hides.
+    SettingsChanged { warnings: Vec<String> },
 }
 
 #[derive(Serialize)]
@@ -110,6 +138,8 @@ type CmdResult<T> = Result<T, String>;
 struct WorkspaceInfo {
     root: String,
     name: String,
+    /// Problems with `.vscode/settings.json`.
+    settings_warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -166,13 +196,22 @@ async fn open_workspace<R: Runtime>(app: AppHandle<R>, state: State<'_, AppState
         }
     });
 
+    let settings = Arc::new(Settings::load(&root));
     let info = WorkspaceInfo {
         root: root.to_string_lossy().into_owned(),
         name: root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string()),
+        settings_warnings: settings.warnings.clone(),
     };
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    *state.session.lock().unwrap() =
-        Some(Session { id, root: root.clone(), docs: DocumentStore::new(), lsp, watcher: None, search: None });
+    *state.session.lock().unwrap() = Some(Session {
+        id,
+        root: root.clone(),
+        docs: DocumentStore::new(),
+        lsp,
+        watcher: None,
+        search: None,
+        settings,
+    });
     start_watcher(app, id, root);
     Ok(info)
 }
@@ -204,20 +243,26 @@ fn start_watcher<R: Runtime>(app: AppHandle<R>, session_id: u64, root: PathBuf) 
 /// Runs on the watcher thread.
 fn handle_watch_event<R: Runtime>(app: &AppHandle<R>, session_id: u64, event: WatchEvent) {
     let state = app.state::<AppState>();
+    let mut settings_changed = false;
     let event = match event {
         WatchEvent::Error(message) => {
             log::warn!("file watcher: {message}");
             FsEvent::Error { message }
         }
-        WatchEvent::Rescan => FsEvent::Rescan { documents: check_documents(&state, session_id, None) },
+        WatchEvent::Rescan => {
+            settings_changed = true;
+            FsEvent::Rescan { documents: check_documents(&state, session_id, None) }
+        }
         WatchEvent::Changes(changes) => {
-            let lsp = {
+            let (lsp, settings_file) = {
                 let guard = state.session.lock().unwrap();
                 match guard.as_ref().filter(|s| s.id == session_id) {
-                    Some(session) => Arc::clone(&session.lsp),
+                    Some(session) => (Arc::clone(&session.lsp), settings_path(&session.root)),
                     None => return,
                 }
             };
+            // The file itself, or `.vscode` as a whole, changed.
+            settings_changed = changes.iter().any(|c| settings_file.starts_with(&c.path));
             lsp.files_changed(changes.iter().filter_map(lsp_file_event).collect());
             let documents = check_documents(&state, session_id, Some(&changes));
             let changes = changes
@@ -228,6 +273,29 @@ fn handle_watch_event<R: Runtime>(app: &AppHandle<R>, session_id: u64, event: Wa
         }
     };
     let _ = app.emit(FS_EVENT, &event);
+    if settings_changed {
+        reload_settings(app, session_id);
+    }
+}
+
+/// Loads `.vscode/settings.json` again and tells the UI.
+fn reload_settings<R: Runtime>(app: &AppHandle<R>, session_id: u64) {
+    let state = app.state::<AppState>();
+    let Some(root) = state.session.lock().unwrap().as_ref().filter(|s| s.id == session_id).map(|s| s.root.clone())
+    else {
+        return;
+    };
+    let settings = Arc::new(Settings::load(&root));
+    let warnings = settings.warnings.clone();
+    {
+        let mut guard = state.session.lock().unwrap();
+        let Some(session) = guard.as_mut().filter(|s| s.id == session_id) else { return };
+        session.settings = settings;
+    }
+    for warning in &warnings {
+        log::warn!("{warning}");
+    }
+    let _ = app.emit(FS_EVENT, &FsEvent::SettingsChanged { warnings });
 }
 
 fn lsp_file_event(change: &FileChange) -> Option<FileEvent> {
@@ -277,11 +345,9 @@ fn check_documents(state: &AppState, session_id: u64, changes: Option<&[FileChan
 
 #[tauri::command]
 async fn list_dir(state: State<'_, AppState>, path: Option<String>) -> CmdResult<Vec<DirEntry>> {
-    let dir = match path {
-        Some(p) => PathBuf::from(p),
-        None => with_session(&state, |s| Ok(s.root.clone()))?,
-    };
-    rc_core::list_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+    let (root, settings) = with_session(&state, |s| Ok((s.root.clone(), Arc::clone(&s.settings))))?;
+    let dir = path.map(PathBuf::from).unwrap_or_else(|| root.clone());
+    rc_core::list_dir(&dir, &root, &settings.files_exclude).map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// Opens a document by path or `file://` URI. Opening an already-open document
@@ -388,7 +454,8 @@ async fn search_text<R: Runtime>(
     query: TextSearchQuery,
 ) -> CmdResult<SearchStarted> {
     let (search, skip, open_documents, cancel, session_id) = with_session(&state, |session| {
-        let search = TextSearch::new(&session.root, &query).map_err(|e| e.to_string())?;
+        let search =
+            TextSearch::new(&session.root, &query, &session.settings.search_excludes).map_err(|e| e.to_string())?;
         let mut skip = HashSet::new();
         let mut open_documents = Vec::new();
         for doc in session.docs.documents() {
@@ -664,5 +731,66 @@ mod tests {
         let err = invoke(&webview, "search_text", json!({"searchId": 8, "query": {"pattern": "(", "isRegex": true}}));
         assert!(err.unwrap_err().as_str().unwrap().contains("unclosed group"));
         invoke(&webview, "cancel_search", json!({"searchId": 7})).unwrap();
+    }
+
+    #[test]
+    fn workspace_settings_drive_explorer_and_search_and_reload_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = rc_core::uri::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/keep")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/other")).unwrap();
+        std::fs::write(root.join("node_modules/keep/a.txt"), "needle").unwrap();
+        std::fs::write(root.join("node_modules/other/b.txt"), "needle").unwrap();
+        std::fs::write(root.join("secret.txt"), "needle").unwrap();
+        let settings = root.join(".vscode/settings.json");
+        std::fs::write(
+            &settings,
+            r#"{ "files.exclude": { "secret.txt": true, "bad[": true }, // comment
+                 "search.exclude": { "!node_modules/keep": true }, }"#,
+        )
+        .unwrap();
+
+        let app = setup(mock_builder()).build(mock_context(noop_assets())).unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let (fs_tx, fs_rx) = mpsc::channel::<Value>();
+        app.listen_any(FS_EVENT, move |e| {
+            let _ = fs_tx.send(serde_json::from_str(e.payload()).unwrap());
+        });
+        let (search_tx, search_rx) = mpsc::channel::<Value>();
+        app.listen_any(SEARCH_EVENT, move |e| {
+            let _ = search_tx.send(serde_json::from_str(e.payload()).unwrap());
+        });
+
+        let info = invoke(&webview, "open_workspace", json!({"path": root})).unwrap();
+        assert_eq!(info["settingsWarnings"].as_array().unwrap().len(), 1);
+        let names = |webview: &WebviewWindow<MockRuntime>| -> Vec<String> {
+            let entries = invoke(webview, "list_dir", json!({})).unwrap();
+            entries.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap().to_owned()).collect()
+        };
+        assert_eq!(names(&webview), [".vscode", "node_modules"]);
+
+        // The exception re-includes node_modules/keep for search.
+        invoke(&webview, "search_text", json!({"searchId": 1, "query": {"pattern": "needle"}})).unwrap();
+        let mut found = Vec::new();
+        loop {
+            let event = search_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            if event["kind"] == "done" {
+                break;
+            }
+            for file in event["files"].as_array().unwrap() {
+                found.push(file["path"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(found, [root.join("node_modules/keep/a.txt").to_string_lossy()]);
+
+        // Editing the settings file reloads it.
+        wait_event(
+            &fs_rx,
+            "settings reload",
+            &|| std::fs::write(&settings, r#"{ "files.exclude": { "**/node_modules": true } }"#).unwrap(),
+            &|e| e["kind"] == "settingsChanged",
+        );
+        assert_eq!(names(&webview), [".vscode", "secret.txt"]);
     }
 }

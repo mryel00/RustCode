@@ -3,8 +3,10 @@
 
 pub mod document;
 pub mod fs;
+pub mod glob;
 pub mod language;
 pub mod search;
+pub mod settings;
 pub mod text;
 pub mod uri;
 pub mod watcher;

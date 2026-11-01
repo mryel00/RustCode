@@ -52,6 +52,10 @@ void backend.onFsEvent((event) => {
     case 'error':
       toast(`File changes may not be picked up: ${event.message}`, 'warning');
       break;
+    case 'settingsChanged':
+      event.warnings.forEach((w) => toast(w, 'warning'));
+      void explorer.refresh();
+      break;
   }
 });
 
@@ -114,6 +118,7 @@ async function openWorkspace(path: string): Promise<void> {
   try {
     const info = await backend.openWorkspace(path);
     workspaceName = info.name;
+    info.settingsWarnings.forEach((w) => toast(w, 'warning'));
     searchModel.setRoot(info.root);
     searchView.setWorkspace(true);
     $('workspace-name').textContent = info.name;

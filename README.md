@@ -15,6 +15,10 @@ regex (with look-around), preserve case, files to include/exclude, `.gitignore` 
 default excludes, unsaved changes in open files, results that follow your edits, and
 replace one match, one file or everything.
 
+**Settings:** the folder's `.vscode/settings.json` is read for `files.exclude` and
+`search.exclude`, including `!` exclude exceptions (for example
+`"!node_modules/mylib": true` to search one dependency) and `when` sibling clauses.
+
 ## Requirements
 
 - Rust 1.88+ (edition 2024) and Node.js 20+
@@ -56,7 +60,8 @@ npm run build            # type-checks and bundles the UI
 ## Layout
 
 ```
-crates/rc-core   text model (ropes, UTF-16 positions), documents, file system, watcher, search
+crates/rc-core   text model (ropes, UTF-16 positions), documents, file system, watcher,
+                 search, globs and exclude expressions, workspace settings
 crates/rc-lsp    LSP framing, client, per-language server manager
 src-tauri        Tauri app: commands + event bridge between UI and the crates
 src              UI: Monaco setup, workbench (explorer, tabs, status bar), LSP adapters

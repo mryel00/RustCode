@@ -7,6 +7,8 @@ import type * as L from 'vscode-languageserver-types';
 export interface WorkspaceInfo {
   root: string;
   name: string;
+  /** Problems with `.vscode/settings.json`. */
+  settingsWarnings: string[];
 }
 
 export interface DirEntry {
@@ -41,7 +43,9 @@ export interface DiskChange {
 export type FsEvent =
   | { kind: 'changes'; changes: FsChange[]; documents: DiskChange[] }
   | { kind: 'rescan'; documents: DiskChange[] }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: string }
+  /** `.vscode/settings.json` was loaded again (`files.exclude` may hide other files). */
+  | { kind: 'settingsChanged'; warnings: string[] };
 
 export type SaveOutcome = 'saved' | 'conflict';
 

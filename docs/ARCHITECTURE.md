@@ -85,9 +85,17 @@ folder with ripgrep's own `ignore` crate:
 
 - Hidden files are searched, symlinks followed, `.gitignore`, `.ignore` and
   `.rgignore` honored (not those of parent folders, not the global one), and
-  VS Code's default `files.exclude` and `search.exclude` (`node_modules`,
-  `bower_components`, `*.code-search`) left out. The "Use Exclude Settings and
-  Ignore Files" toggle turns all of that off.
+  `files.exclude` and `search.exclude` (see Settings; by default `.git`,
+  `node_modules`, `bower_components`, `*.code-search` …) left out. The "Use
+  Exclude Settings and Ignore Files" toggle turns all of that off.
+- Exclude exceptions (`"!node_modules/mylib": true` in those settings)
+  re-include paths that excludes or ignore files leave out. ripgrep does not
+  descend into excluded folders, so, like VS Code, a second walk without
+  ignore files visits only the folders leading to the exceptions
+  (`getExcludeExceptionGlobs`) and reports what the first walk did not.
+  Version control folders (`.git`, `.svn`, `.hg`, `.jj`) are only walked
+  when an exception names them. A `!` typed in "files to exclude" is matched
+  literally: there, as in VS Code, it is not a setting.
 - "files to include/exclude" are expanded like VS Code's `QueryBuilder`
   (`*.ts` → `**/*.ts/**`, `**/*.ts`; `./src` anchored at the folder; `.ts` →
   `*.ts`; absolute paths inside the folder), handed to the walk as `rg -g`
@@ -145,6 +153,30 @@ Events (status, diagnostics, progress, messages) flow to the UI as one
 `lsp-event` stream. The UI registers Monaco providers per server once it is
 ready, using the server's own completion trigger characters.
 
+## Settings
+
+`rc-core::settings` reads the folder's `.vscode/settings.json` (comments and
+trailing commas allowed, dotted or nested keys), so projects set up for
+VS Code behave the same. Only `files.exclude` and `search.exclude` are read
+so far. Like VS Code, object settings are merged key by key with their
+defaults, so `"**/.git": false` shows `.git` again.
+
+Exclude expressions follow `base/common/glob.ts` (`rc-core::glob`): patterns
+map to `true`, `false` or a sibling clause (`{ "when": "$(basename).ts" }`,
+excluded only when that sibling exists), and `!`-prefixed keys are
+exceptions. The ripgrep walk can only apply plain enabled patterns; sibling
+clauses and exceptions are applied to every result.
+
+Patterns that are not valid globs are left out and reported, and a file that
+is not valid JSON falls back to the defaults with a warning. The file watcher
+reloads the settings when the file (or `.vscode`) changes and sends
+`settingsChanged`; the explorer then lists its folders again.
+
+The explorer applies `files.exclude` like VS Code (`evaluateExcludeTreeEntry`):
+an entry is hidden when it or its folder is excluded and no exception covers
+it, but an excluded folder that an exception could match beneath is still
+listed, holding only what the exception re-includes.
+
 ## UI
 
 An activity bar switches the side bar between the Explorer and the Search
@@ -174,9 +206,10 @@ Extensions are planned, not built. The design keeps that door open:
 
 - A crashed language server is not restarted automatically (reopen the folder).
 - No terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
-- `files.watcherExclude`, `files.exclude` and `search.exclude` are fixed to
-  VS Code's defaults (no settings yet), and there is no diff view for save
-  conflicts (VS Code's "Compare").
+- Settings: only the workspace's `.vscode/settings.json`, and only
+  `files.exclude` and `search.exclude`; no user settings. `files.watcherExclude`
+  is fixed to VS Code's defaults. The explorer does not show excluded files
+  that are open in an editor (VS Code does).
+- No diff view for save conflicts (VS Code's "Compare").
 - Search: no search editor, tree view mode, search history or replace diff
-  preview; exclude exceptions (`!pattern`) are refused; non-UTF-8 files are
-  searched lossily but cannot be opened.
+  preview; non-UTF-8 files are searched lossily but cannot be opened.
