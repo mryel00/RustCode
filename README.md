@@ -52,3 +52,7 @@ src              UI: Monaco setup, workbench (explorer, tabs, status bar), LSP a
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
