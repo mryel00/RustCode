@@ -430,6 +430,11 @@ kbd {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  cursor: pointer;
+}
+
+.server-status:hover {
+  text-decoration: underline;
 }
 
 /* Toasts */

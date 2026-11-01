@@ -153,6 +153,9 @@ export const backend = {
   acceptDiskRead: (uri: string, readId: number) => invoke<void>('accept_disk_read', { uri, readId }),
   closeDocument: (uri: string) => invoke<void>('close_document', { uri }),
   lspRequest: <T>(uri: string, method: string, params: unknown) => invoke<T | null>('lsp_request', { uri, method, params }),
+  /** Restarts a server, named or as the server of a document; resolves to its name. */
+  restartLanguageServer: (target: { server: string } | { uri: string }) =>
+    invoke<string>('restart_language_server', target),
   searchText: (searchId: number, query: TextSearchQuery) => invoke<SearchStarted>('search_text', { searchId, query }),
   cancelSearch: (searchId: number) => invoke<void>('cancel_search', { searchId }),
   onSearchEvent: (handler: (event: SearchEvent) => void): Promise<UnlistenFn> =>

@@ -19,7 +19,7 @@ const docs = new Documents();
 const features = new LanguageFeatures(docs);
 const group = new EditorGroup(docs, $('tabs'), $('editor'), $('welcome'));
 const explorer = new Explorer($('explorer'));
-const statusBar = new StatusBar(features);
+const statusBar = new StatusBar(features, (server) => restartLanguageServer({ server }));
 const sidebar = new Sidebar($('activitybar'), $('sidebar'), $('sash'), {
   explorer: $('view-explorer'),
   search: $('view-search'),
@@ -39,6 +39,21 @@ function applySettings(settings: UiSettings): void {
 }
 
 const report = (err: unknown) => toast(errorMessage(err), 'error');
+
+function restartLanguageServer(target: { server: string } | { uri: string }): void {
+  backend.restartLanguageServer(target).catch(report);
+}
+
+// Like the "Restart Server" commands of VS Code's language extensions, in the
+// editor's command palette (F1): restarts the server of the active file.
+group.editor.addAction({
+  id: 'rustcode.restartLanguageServer',
+  label: 'Restart Language Server',
+  run: () => {
+    const doc = group.activeDoc;
+    if (doc) restartLanguageServer({ uri: doc.uri });
+  },
+});
 docs.onError.on((m) => toast(m, 'error'));
 explorer.onError.on((m) => toast(m, 'error'));
 features.onMessage.on(({ level, message }) =>

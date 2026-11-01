@@ -96,11 +96,12 @@ export class LanguageFeatures {
     this.servers.set(server, { status });
     if (status.state === 'ready') {
       this.register(server, status.languages, status.completionTriggerCharacters);
-    } else if (status.state !== 'starting') {
+    } else {
+      // Not running (also while restarting): like vscode-languageclient, drop
+      // its providers, progress and diagnostics until it is ready again.
       this.registrations.get(server)?.forEach((d) => d.dispose());
       this.registrations.delete(server);
       this.progress.delete(server);
-      // Like vscode-languageclient, a stopped or restarting server's diagnostics go away.
       this.clearDiagnostics(server);
       if (status.state === 'failed') this.onMessage.fire({ level: 'error', message: `${server} failed to start: ${status.message}` });
       // A restart is only logged; giving up is shown (DefaultErrorHandler).

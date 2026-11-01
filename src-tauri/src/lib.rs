@@ -480,6 +480,28 @@ async fn lsp_request(state: State<'_, AppState>, uri: String, method: String, pa
     }
 }
 
+/// Restarts a language server of the open folder, named directly or as the
+/// server of document `uri` (like the "Restart Server" commands VS Code's
+/// language extensions add). Returns the server's name.
+#[tauri::command]
+async fn restart_language_server(
+    state: State<'_, AppState>,
+    server: Option<String>,
+    uri: Option<String>,
+) -> CmdResult<String> {
+    let lsp = with_session(&state, |s| Ok(Arc::clone(&s.lsp)))?;
+    let server = match (server, uri) {
+        (Some(server), _) => server,
+        (None, Some(uri)) => lsp.server_of(&parse_uri(&uri)?).ok_or("no language server handles this file")?,
+        (None, None) => return Err("no language server given".into()),
+    };
+    if lsp.restart(&server) {
+        Ok(server)
+    } else {
+        Err(format!("{server} has not been started in this folder"))
+    }
+}
+
 /// Starts searching the folder for `query`. Results arrive as `search-event`s
 /// tagged with `search_id`; a running search is cancelled.
 #[tauri::command]
@@ -589,6 +611,7 @@ fn setup<R: Runtime>(builder: tauri::Builder<R>, state: AppState) -> tauri::Buil
         accept_disk_read,
         close_document,
         lsp_request,
+        restart_language_server,
         search_text,
         cancel_search,
     ])

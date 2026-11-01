@@ -7,7 +7,8 @@
 //! still starting.
 //!
 //! A server that exits on its own is restarted like vscode-languageclient does
-//! (up to five closes in three minutes) and gets every open document again.
+//! (up to five closes in three minutes) and gets every open document again;
+//! [`LspManager::restart`] restarts one on request.
 
 use crate::{
     client::{Incoming, LspClient, LspError},
@@ -66,6 +67,7 @@ enum Cmd {
     Close { uri: Url },
     FilesChanged { changes: Vec<FileEvent> },
     Request { method: String, params: Value, reply: oneshot::Sender<Result<Value, LspError>> },
+    Restart,
     Shutdown { done: oneshot::Sender<()> },
 }
 
@@ -144,6 +146,18 @@ impl LspManager {
         rx.await.unwrap_or(Err(LspError::ServerExited))
     }
 
+    /// Stops the server (gracefully) and starts it again with every open
+    /// document, also when it had failed or crashed too often. Returns false
+    /// when that server has not been started in this workspace.
+    pub fn restart(&self, server_id: &str) -> bool {
+        self.servers.lock().unwrap().get(server_id).is_some_and(|tx| tx.send(Cmd::Restart).is_ok())
+    }
+
+    /// The server a document was sent to.
+    pub fn server_of(&self, uri: &Url) -> Option<String> {
+        self.docs.lock().unwrap().get(uri).cloned()
+    }
+
     /// Shuts down every running server.
     pub async fn shutdown(&self) {
         let senders: Vec<_> = self.servers.lock().unwrap().drain().map(|(_, tx)| tx).collect();
@@ -200,8 +214,12 @@ async fn run_server(
             Started::Ready(client, incoming, caps) => (client, incoming, caps),
             Started::Failed(failure, reason) => {
                 status(failure);
-                return reject_all(queued, rx, reason).await;
+                if stopped(&mut queued, &mut rx, &mut mirrors, &reason).await {
+                    continue;
+                }
+                return;
             }
+            Started::Restart => continue,
             Started::ShutDown => return,
         };
         status(ServerStatus::Ready {
@@ -241,6 +259,12 @@ async fn run_server(
                             let _ = done.send(());
                             return;
                         }
+                        // Asked for (like vscode-languageclient's restart()): stop
+                        // gracefully and start again; not counted as a crash.
+                        Some(Cmd::Restart) => {
+                            client.shutdown().await;
+                            break None;
+                        }
                         Some(cmd) => handle(cmd, &client, &caps, &sync, &mut mirrors),
                         None => {
                             client.shutdown().await;
@@ -249,12 +273,13 @@ async fn run_server(
                     }
                 }
                 event = incoming.recv() => match event {
-                    Some(Incoming::Exited(code)) => break code,
-                    None => break None,
+                    Some(Incoming::Exited(code)) => break Some(code),
+                    None => break Some(None),
                     Some(event) => forward(&id, event, &events),
                 }
             }
         };
+        let Some(code) = code else { continue };
 
         // The server went away without being asked to: restart it unless it
         // keeps crashing (vscode-languageclient's DefaultErrorHandler.closed).
@@ -269,7 +294,9 @@ async fn run_server(
             );
             let _ = events.send(ManagerEvent::Log { server: id.clone(), level: "error", message: message.clone() });
             status(ServerStatus::Exited { code, restarting: false, message: message.clone() });
-            return reject_all(VecDeque::new(), rx, message).await;
+            if !stopped(&mut queued, &mut rx, &mut mirrors, &message).await {
+                return;
+            }
         }
     }
 }
@@ -278,12 +305,14 @@ enum Started {
     Ready(LspClient, mpsc::UnboundedReceiver<Incoming>, Box<ServerCapabilities>),
     /// The status to report and the reason to give requests.
     Failed(ServerStatus, String),
+    /// A restart was asked for while starting: start over.
+    Restart,
     /// Shut down (or the manager went away) before the server was ready.
     ShutDown,
 }
 
 /// Spawns the server and runs the `initialize` handshake. Commands arriving
-/// meanwhile are queued, except a shutdown, which ends the start.
+/// meanwhile are queued, except a shutdown or restart, which ends the start.
 async fn start(
     config: &ServerConfig,
     root: &Url,
@@ -324,6 +353,10 @@ async fn start(
                         let _ = done.send(());
                         return Started::ShutDown;
                     }
+                    Some(Cmd::Restart) => {
+                        client.kill().await;
+                        return Started::Restart;
+                    }
                     Some(cmd) => queued.push_back(cmd),
                     None => {
                         client.kill().await;
@@ -342,6 +375,50 @@ async fn start(
             };
             client.shutdown().await;
             Started::Failed(ServerStatus::Failed { message }, e.to_string())
+        }
+    }
+}
+
+/// While no server process runs (it failed to start, is not installed or
+/// crashed too often): keep the mirrors up to date, answer requests (queued
+/// ones first) with an error and drop everything else. Returns true when a
+/// restart is asked for, false on shutdown.
+async fn stopped(
+    queued: &mut VecDeque<Cmd>,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    mirrors: &mut HashMap<Url, Mirror>,
+    reason: &str,
+) -> bool {
+    loop {
+        let cmd = match queued.pop_front() {
+            Some(cmd) => cmd,
+            None => match rx.recv().await {
+                Some(cmd) => cmd,
+                None => return false,
+            },
+        };
+        match cmd {
+            Cmd::Open { uri, language_id, version, text } => {
+                mirrors.insert(uri, Mirror { language_id, version, text: Rope::from_str(&text) });
+            }
+            Cmd::Change { uri, version, changes } => {
+                if let Some(mirror) = mirrors.get_mut(&uri) {
+                    rc_core::text::apply_changes(&mut mirror.text, &changes);
+                    mirror.version = version;
+                }
+            }
+            Cmd::Close { uri } => {
+                mirrors.remove(&uri);
+            }
+            Cmd::Request { reply, .. } => {
+                let _ = reply.send(Err(LspError::Unavailable(reason.to_owned())));
+            }
+            Cmd::Save { .. } | Cmd::FilesChanged { .. } => {}
+            Cmd::Restart => return true,
+            Cmd::Shutdown { done } => {
+                let _ = done.send(());
+                return false;
+            }
         }
     }
 }
@@ -446,30 +523,7 @@ fn handle(cmd: Cmd, client: &LspClient, caps: &ServerCapabilities, sync: &SyncIn
                 }
             }
         }
-        Cmd::Shutdown { .. } => unreachable!("handled by run_server"),
-    }
-}
-
-/// After a server failed to start or stopped for good: answer requests (queued
-/// ones first) with an error and drop everything else, until the manager shuts
-/// down.
-async fn reject_all(queued: VecDeque<Cmd>, mut rx: mpsc::UnboundedReceiver<Cmd>, reason: String) {
-    for cmd in queued {
-        if let Cmd::Request { reply, .. } = cmd {
-            let _ = reply.send(Err(LspError::Unavailable(reason.clone())));
-        }
-    }
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Cmd::Request { reply, .. } => {
-                let _ = reply.send(Err(LspError::Unavailable(reason.clone())));
-            }
-            Cmd::Shutdown { done } => {
-                let _ = done.send(());
-                return;
-            }
-            _ => {}
-        }
+        Cmd::Restart | Cmd::Shutdown { .. } => unreachable!("handled by run_server"),
     }
 }
 

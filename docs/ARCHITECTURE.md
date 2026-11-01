@@ -163,6 +163,14 @@ ready. A server that fails during `initialize` is not restarted (VS Code stops
 it too), and shutting down while a server is still starting kills it instead
 of waiting for the handshake.
 
+"Restart Language Server" (the editor's command palette, F1, for the active
+file's server, or a click on a server in the status bar) does what the
+"Restart Server" commands of VS Code's language extensions do: a graceful
+`shutdown`/`exit`, then a fresh start with every open document. It also brings
+back a server that failed, was not installed or crashed too often; while
+stopped, the task keeps its mirrors up to date for that. As in
+vscode-languageclient, a manual restart does not reset the crash count.
+
 Events (status, diagnostics, progress, messages) flow to the UI as one
 `lsp-event` stream. The UI registers Monaco providers per server once it is
 ready, using the server's own completion trigger characters.
@@ -243,8 +251,6 @@ Extensions are planned, not built. The design keeps that door open:
 
 ## Known limitations
 
-- A language server that crashed too often stays stopped until the folder is
-  reopened (VS Code extensions usually add their own "Restart Server" command).
 - No terminal, settings UI, multiple editor groups, or `workspace/applyEdit`.
 - Settings: only the settings in the table above, from the default VS Code
   profile (no other profiles, `.code-workspace` files or language-specific

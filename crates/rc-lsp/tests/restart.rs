@@ -111,6 +111,47 @@ async fn server_crashing_five_times_in_three_minutes_stays_stopped() {
     assert_eq!(message, "The fake server crashed 5 times in the last 3 minutes. The server will not be restarted.");
     let err = f.mgr.request(&f.uri, "fake/state", json!({})).await.unwrap_err();
     assert!(matches!(err, LspError::Unavailable(_)), "{err:?}");
+
+    // Edits while stopped are kept, and a manual restart brings it back.
+    f.mgr.change(&f.uri, 1, vec![replace_all("y")]);
+    assert!(f.mgr.restart("fake"));
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(matches!(f.status().await, ServerStatus::Ready { .. }));
+    assert_eq!(f.state().await["docs"][f.uri.as_str()], json!({"version": 1, "text": "y"}));
+    f.mgr.shutdown().await;
+}
+
+fn replace_all(text: &str) -> TextDocumentContentChangeEvent {
+    TextDocumentContentChangeEvent { range: None, range_length: None, text: text.into() }
+}
+
+#[tokio::test]
+async fn restart_on_request_starts_a_new_process_with_open_documents() {
+    let Some(mut f) = fixture(&[]) else { return };
+    assert!(!f.mgr.restart("fake"), "not started yet");
+    f.mgr.open(f.uri.clone(), "fake", 0, "a".into());
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(matches!(f.status().await, ServerStatus::Ready { .. }));
+    f.mgr.change(&f.uri, 1, vec![replace_all("b")]);
+    let before = f.state().await;
+
+    assert!(f.mgr.restart("fake"));
+    let after = f.state().await;
+    // No exit is reported: the restart was asked for.
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(matches!(f.status().await, ServerStatus::Ready { .. }));
+    assert_ne!(before["pid"], after["pid"]);
+    assert_eq!(after["docs"][f.uri.as_str()], json!({"version": 1, "text": "b"}));
+    f.mgr.shutdown().await;
+}
+
+#[tokio::test]
+async fn restart_while_starting_starts_over() {
+    let Some(mut f) = fixture(&["--slow-init"]) else { return };
+    f.mgr.open(f.uri.clone(), "fake", 0, "x".into());
+    assert!(matches!(f.status().await, ServerStatus::Starting));
+    assert!(f.mgr.restart("fake"));
+    assert!(matches!(f.status().await, ServerStatus::Starting));
     f.mgr.shutdown().await;
 }
 

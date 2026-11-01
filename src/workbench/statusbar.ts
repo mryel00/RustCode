@@ -11,7 +11,10 @@ export class StatusBar {
   private readonly eol = document.getElementById('status-eol')!;
   private readonly language = document.getElementById('status-language')!;
 
-  constructor(private readonly features: LanguageFeatures) {
+  constructor(
+    private readonly features: LanguageFeatures,
+    private readonly restartServer: (server: string) => void,
+  ) {
     features.onDidChangeServers.on(() => this.renderServers());
     features.onDidChangeProblems.on((c) => this.renderProblems(c));
     this.renderProblems({ errors: 0, warnings: 0 });
@@ -64,7 +67,8 @@ export class StatusBar {
           title = `${name} exited (code ${status.code ?? 'unknown'}). ${status.message}`;
           break;
       }
-      el.title = title;
+      el.title = `${title}\nClick to restart ${name}`;
+      el.addEventListener('click', () => this.restartServer(name));
       const iconEl = document.createElement('span');
       iconEl.className = `codicon ${icon}`;
       el.append(iconEl, ` ${text}`);
