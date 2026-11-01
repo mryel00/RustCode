@@ -19,6 +19,9 @@ export default defineConfig({
     watch: { ignored: ['**/src-tauri/**', '**/target/**', '**/crates/**'] },
   },
   worker: { format: 'es' },
+  // Pre-bundling turns Monaco's `?worker` import into a module without a
+  // default export, which breaks the dev server.
+  optimizeDeps: { exclude: ['monaco-esm'] },
   build: {
     target: 'es2022',
     chunkSizeWarningLimit: 6000,
